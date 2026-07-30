@@ -21,29 +21,6 @@
  * NDJSON stream into lines and hands text to the GTK main loop through
  * g_idle_add(). No GTK call is ever made off the main thread.
  *
- * Features added in this revision:
- *   1. The left/centre split lives in a GtkPaned (draggable divider), and
- *      the "Split follows mouse pointer" toggle steers that divider by
- *      simply moving the pointer left/right across the window.
- *   2. "Extract code…" pulls every fenced code / script block out of the
- *      last reply and writes one file per block (extension taken from the
- *      fence language); "Extract points…" writes the reply's headings and
- *      bullet/numbered items to a markdown file. Both save through a
- *      folder picker into a timestamped subfolder.
- *   4. Server page: start/stop "ollama serve" as a child process with its
- *      log, run "ollama signin", and hold an API key for ollama.com.
- *   5. Models page: pull a model with live progress, and list what is
- *      installed together with what is resident right now (/api/ps).
- *   6. Usage page: per-model token ledger with prices, budget, paid usage,
- *      extra usage and remaining budget. Ollama exposes no account quota
- *      endpoint, so this is a local tally of the token counts each response
- *      reports, priced with rates you enter — an estimate, not your account.
- *
- *   3. The "Colour" toggle renders the transcript with a colourful,
- *      markdown-aware presentation: headings, dark fenced-code blocks with
- *      keyword/string/number/comment highlighting, inline code, bold,
- *      links, quotes, list markers and coloured role headers.
- *
  * API reference: https://github.com/ollama/ollama/blob/main/docs/api.md
  */
 
@@ -69,7 +46,6 @@ static const char *const ENDPOINTS[] = {
     "/api/chat", "/api/generate", NULL
 };
 
-/* feature 1: minimum widths for the two panes */
 #define PANE_LEFT_MIN   280
 #define PANE_RIGHT_MIN  360
 
@@ -86,7 +62,6 @@ typedef struct {
     LoadMode mode;
 } Attachment;
 
-/* feature 6: one ledger row per model */
 typedef struct {
     char    *model;
     gboolean cloud;              /* billed: cloud tag, or host ollama.com */
@@ -126,43 +101,35 @@ typedef struct {
     volatile gint cancel;
     gboolean      busy;
 
-    /* feature 1: paned split + pointer steering */
     GtkWidget *paned;
     GtkWidget *ptr_cb;
 
-    /* feature 2: extraction buttons */
     GtkWidget *code_btn, *points_btn;
 
-    /* feature 3: colourful rendering */
     GtkWidget *colour_cb;
     gboolean   tags_ready;
 
-    /* feature 4: server control and sign-in */
     GtkWidget   *serve_cmd_e, *signin_cmd_e, *apikey_entry, *remember_key_cb;
     GtkWidget   *serve_btn, *serve_stop_btn, *version_label;
     GtkTextBuffer *log_buf;
     GSubprocess *server_proc;
 
-    /* feature 5: pulling models and the installed inventory */
     GtkWidget     *pull_entry, *pull_btn, *pull_bar, *pull_status;
     GtkTextBuffer *models_buf;
     volatile gint  pull_cancel;
     gboolean       pulling;
 
-    /* feature 6: token ledger and budget */
     GtkWidget     *price_in_e, *price_out_e, *budget_e, *currency_e;
     GtkWidget     *usage_summary;
     GtkTextBuffer *usage_buf;
     GPtrArray     *usage;        /* Usage* */
     char          *period_start;
 
-    /* configuration, read before the widgets exist */
     char *cfg_host, *cfg_key, *cfg_price_in, *cfg_price_out;
     char *cfg_budget, *cfg_currency, *cfg_serve_cmd, *cfg_signin_cmd;
     gboolean cfg_remember_key;
 } App;
 
-/* features 4-6: defined further down, used by the code above them */
 static char *auth_header(App *app);
 static void  usage_record(App *app, const char *model, gint64 in_tok,
                           gint64 out_tok);
@@ -466,10 +433,6 @@ static gboolean build_user_content(App *app, const char *text,
     return TRUE;
 }
 
-/* ------------------------------------------------------------------ */
-/* FEATURE 1: left/right panes regulated by mouse pointer              */
-/* ------------------------------------------------------------------ */
-
 /*
  * The settings/chat split is a GtkPaned, so the divider can always be
  * dragged by hand. On top of that, while the "Split follows mouse
@@ -509,7 +472,7 @@ static void on_root_motion(GtkEventControllerMotion *ctrl,
 }
 
 /* ------------------------------------------------------------------ */
-/* FEATURE 2: extract code / scripts / points from the reply          */
+/* extract code / scripts / points from the reply                     */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -783,7 +746,7 @@ static void on_extract_points(GtkButton *b, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
-/* FEATURE 3: colourful rendering of answers                           */
+/* colourful rendering of answers                                     */
 /* ------------------------------------------------------------------ */
 
 static void ensure_tags(App *app)
@@ -1304,8 +1267,8 @@ typedef struct {
     App  *app;
     char *url;
     char *body;
-    char *auth;                /* feature 4: Authorization header, or NULL */
-    char *model;               /* feature 6: for the token ledger          */
+    char *auth;                /* Authorization header, or NULL */
+    char *model;               /* for the token ledger          */
     gint64 in_tokens;
     gint64 out_tokens;
     gboolean streaming;
@@ -1326,7 +1289,7 @@ typedef struct {
     App  *app;
     char *response;
     char *status;
-    char *model;               /* feature 6 */
+    char *model;
     gint64 in_tokens;
     gint64 out_tokens;
 } UiDone;
@@ -1405,7 +1368,7 @@ static gboolean ui_done_cb(gpointer p)
         g_object_unref(b);
     }
 
-    /* feature 6: fold this exchange into the ledger and persist it */
+    /* fold this exchange into the ledger and persist it */
     if (d->in_tokens > 0 || d->out_tokens > 0) {
         usage_record(app, d->model, d->in_tokens, d->out_tokens);
         save_state(app);
@@ -1419,7 +1382,7 @@ static gboolean ui_done_cb(gpointer p)
     gtk_widget_set_sensitive(app->send_btn, TRUE);
     gtk_widget_set_sensitive(app->stop_btn, FALSE);
 
-    finish_render(app);                 /* feature 3: decorate the reply */
+    finish_render(app);                 /* decorate the reply */
     return G_SOURCE_REMOVE;
 }
 
@@ -1493,7 +1456,7 @@ static void process_chunk_line(Req *r, const char *line)
         gint64 evals = obj_int(o, "eval_count", 0);
         gint64 prompt = obj_int(o, "prompt_eval_count", 0);
 
-        if (prompt > 0)                 /* feature 6 */
+        if (prompt > 0)
             r->in_tokens = prompt;
         if (evals > 0)
             r->out_tokens = evals;
@@ -1560,7 +1523,7 @@ static gpointer req_worker(gpointer data)
 
     curl = curl_easy_init();
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    if (r->auth)                        /* feature 4 */
+    if (r->auth)
         hdrs = curl_slist_append(hdrs, r->auth);
     curl_easy_setopt(curl, CURLOPT_URL, r->url);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, r->body);
@@ -1830,8 +1793,8 @@ static void send_request(App *app)
     r->app = app;
     r->url = url;
     r->body = body;                             /* ownership transferred */
-    r->auth = auth_header(app);                 /* feature 4 */
-    r->model = g_strdup(model);                 /* feature 6 */
+    r->auth = auth_header(app);
+    r->model = g_strdup(model);
     r->streaming = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb));
     r->endpoint = ep;
     r->acc = g_string_new(NULL);
@@ -2074,10 +2037,10 @@ static void on_clear_attach(GtkButton *b, gpointer data)
     set_status(app, "Attachments cleared");
 }
 
-/* ================================================================== */
-/* features 4-6: server control and sign-in, model pulling,           */
-/*               token ledger with budget                             */
-/* ================================================================== */
+/* ==================================================== */
+/* server control and sign-in, model pulling,           */
+/* token ledger with budget                             */
+/* ==================================================== */
 
 /* UI helpers defined further down, used by the page builders below */
 static GtkWidget *section_label(const char *text);
@@ -2173,7 +2136,7 @@ static char *auth_header(App *app)
 }
 
 /* ------------------------------------------------------------------ */
-/* token ledger                                                        */
+/* token ledger                                                       */
 /* ------------------------------------------------------------------ */
 
 static void usage_free(gpointer p)
@@ -2292,7 +2255,7 @@ static void usage_record(App *app, const char *model, gint64 in_tok,
 }
 
 /* ------------------------------------------------------------------ */
-/* configuration and ledger persistence                                */
+/* configuration and ledger persistence                               */
 /* ------------------------------------------------------------------ */
 
 static char *state_path(void)
@@ -2524,7 +2487,7 @@ static void on_save_usage(GtkButton *b, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
-/* server version probe (async)                                        */
+/* server version probe (async)                                       */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -2622,7 +2585,7 @@ static void on_probe_clicked(GtkButton *b, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
-/* installed-model inventory: /api/tags plus /api/ps (async)           */
+/* installed-model inventory: /api/tags plus /api/ps (async)          */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -2817,7 +2780,7 @@ static void on_refresh_all(GtkButton *b, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
-/* pulling a model (/api/pull, streaming progress)                     */
+/* pulling a model (/api/pull, streaming progress)                    */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -3059,7 +3022,7 @@ static void on_pull_cancel(GtkButton *b, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
-/* running the server and signing in, as child processes               */
+/* running the server and signing in, as child processes              */
 /* ------------------------------------------------------------------ */
 
 static void read_next_line(App *app, GDataInputStream *in);
@@ -3238,7 +3201,7 @@ static void on_shutdown(GApplication *gapp, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
-/* the three new pages                                                 */
+/* the three new pages                                                */
 /* ------------------------------------------------------------------ */
 
 static GtkWidget *note_label(const char *text)
@@ -3474,7 +3437,7 @@ static GtkWidget *build_left_pane(App *app, GtkWidget *request_page)
 }
 
 /* ------------------------------------------------------------------ */
-/* UI construction                                                     */
+/* UI construction                                                    */
 /* ------------------------------------------------------------------ */
 
 static GtkWidget *section_label(const char *text)
@@ -3725,7 +3688,7 @@ static void activate(GtkApplication *gapp, gpointer user_data)
                                               PANE_RIGHT_MIN);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(chat_sw), app->chat_view);
 
-    /* -------- feature 1: paned split + pointer steering -------- */
+    /* -------- paned split + pointer steering -------- */
 
     split = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     app->paned = split;
@@ -3778,7 +3741,7 @@ static void activate(GtkApplication *gapp, gpointer user_data)
     spacer = gtk_label_new("");
     gtk_widget_set_hexpand(spacer, TRUE);
 
-    /* feature 2 buttons */
+    /* buttons */
     app->code_btn = gtk_button_new_with_label("Extract code…");
     gtk_widget_set_tooltip_text(app->code_btn,
         "Save every fenced code/script block of the last reply to files");
