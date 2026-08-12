@@ -70,6 +70,15 @@ typedef struct {
     gint64   eval_tokens;
 } Usage;
 
+/* one collapsible "thinking" region in the transcript */
+typedef struct {
+    GtkTextMark *head_start;   /* start of the clickable header line   */
+    GtkTextMark *body_start;   /* first char of the thinking body      */
+    GtkTextMark *body_end;     /* one past the last char of the body   */
+    char        *body_tag;     /* unique tag name carrying "invisible" */
+    gboolean     expanded;     /* TRUE = body shown, FALSE = collapsed */
+} ThinkBlock;
+
 typedef struct {
     GtkWindow     *win;
     GtkWidget     *host_entry;
@@ -105,9 +114,15 @@ typedef struct {
     GtkWidget *ptr_cb;
 
     GtkWidget *code_btn, *points_btn;
+    GtkWidget *save_sel_btn;     /* enabled only while chat text is selected */
 
     GtkWidget *colour_cb;
     gboolean   tags_ready;
+
+    /* collapsible "thinking" blocks in the transcript */
+    GPtrArray  *think_blocks;   /* ThinkBlock*                          */
+    ThinkBlock *think_current;  /* block being streamed, or NULL        */
+    guint       think_seq;      /* ever-increasing id for unique tags   */
 
     GtkWidget   *serve_cmd_e, *signin_cmd_e, *apikey_entry, *remember_key_cb;
     GtkWidget   *serve_btn, *serve_stop_btn, *version_label;
@@ -792,6 +807,112 @@ static void ensure_tags(App *app)
     gtk_text_buffer_create_tag(app->chat_buf, "num", "foreground", "#79c0ff", NULL);
     gtk_text_buffer_create_tag(app->chat_buf, "cmt", "foreground", "#8b949e",
         "style", PANGO_STYLE_ITALIC, NULL);
+    /* clickable header of a collapsible thinking block */
+    gtk_text_buffer_create_tag(app->chat_buf, "thead",
+        "weight", PANGO_WEIGHT_BOLD, "foreground", "#6f42c1", NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* collapsible "thinking" blocks                                       */
+/* ------------------------------------------------------------------ */
+
+static void think_block_free(gpointer p)
+{
+    ThinkBlock *blk = p;
+
+    g_free(blk->body_tag);
+    g_free(blk);
+}
+
+/* set the disclosure arrow on a block's header to match its state */
+static void think_set_arrow(App *app, ThinkBlock *blk)
+{
+    GtkTextIter a, b;
+    char *cur;
+    const char *want = blk->expanded ? "\xE2\x96\xBE"    /* down triangle */
+                                     : "\xE2\x96\xB8";   /* right triangle */
+
+    if (!blk->head_start)
+        return;
+    gtk_text_buffer_get_iter_at_mark(app->chat_buf, &a, blk->head_start);
+    b = a;
+    if (!gtk_text_iter_forward_char(&b))
+        return;
+    cur = gtk_text_buffer_get_text(app->chat_buf, &a, &b, FALSE);
+    if (g_strcmp0(cur, want) != 0) {
+        gtk_text_buffer_delete(app->chat_buf, &a, &b);
+        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &a, blk->head_start);
+        gtk_text_buffer_insert(app->chat_buf, &a, want, -1);
+    }
+    g_free(cur);
+}
+
+/* (re-)apply the header and body tags for one block, honouring its state */
+static void think_apply_one(App *app, ThinkBlock *blk)
+{
+    GtkTextIter hs, bs, be;
+    GtkTextTag *body;
+
+    if (!blk->head_start || !blk->body_start)
+        return;
+
+    body = gtk_text_tag_table_lookup(
+        gtk_text_buffer_get_tag_table(app->chat_buf), blk->body_tag);
+    if (body)
+        g_object_set(body, "invisible", !blk->expanded, NULL);
+
+    gtk_text_buffer_get_iter_at_mark(app->chat_buf, &hs, blk->head_start);
+    gtk_text_buffer_get_iter_at_mark(app->chat_buf, &bs, blk->body_start);
+    gtk_text_buffer_apply_tag_by_name(app->chat_buf, "thead", &hs, &bs);
+
+    if (blk->body_end && body) {
+        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &be, blk->body_end);
+        gtk_text_buffer_apply_tag(app->chat_buf, body, &bs, &be);
+    }
+}
+
+/* re-apply every block's tags — used after a full re-render wipes them */
+static void think_apply_all(App *app)
+{
+    guint i;
+
+    if (!app->think_blocks)
+        return;
+    for (i = 0; i < app->think_blocks->len; i++)
+        think_apply_one(app, g_ptr_array_index(app->think_blocks, i));
+}
+
+/* flip one block open/closed in response to a click on its header */
+static void think_toggle(App *app, ThinkBlock *blk)
+{
+    blk->expanded = !blk->expanded;
+    think_set_arrow(app, blk);
+    think_apply_one(app, blk);
+}
+
+/* drop every block (new chat / buffer reset); call BEFORE clearing text */
+static void think_clear(App *app)
+{
+    GtkTextTagTable *tab = gtk_text_buffer_get_tag_table(app->chat_buf);
+    guint i;
+
+    if (!app->think_blocks)
+        return;
+    for (i = 0; i < app->think_blocks->len; i++) {
+        ThinkBlock *blk = g_ptr_array_index(app->think_blocks, i);
+        GtkTextTag *t = gtk_text_tag_table_lookup(tab, blk->body_tag);
+
+        if (t)
+            gtk_text_tag_table_remove(tab, t);
+        if (blk->head_start)
+            gtk_text_buffer_delete_mark(app->chat_buf, blk->head_start);
+        if (blk->body_start)
+            gtk_text_buffer_delete_mark(app->chat_buf, blk->body_start);
+        if (blk->body_end)
+            gtk_text_buffer_delete_mark(app->chat_buf, blk->body_end);
+    }
+    g_ptr_array_set_size(app->think_blocks, 0);
+    app->think_current = NULL;
 }
 
 /*
@@ -1021,6 +1142,7 @@ static void re_render_chat(App *app)
         gtk_text_buffer_apply_tag_by_name(app->chat_buf, "code", &body, &e2);
         highlight_code(app, &body, &e2);
     }
+    think_apply_all(app);               /* keep thinking blocks collapsed */
 }
 
 static void on_colour_toggled(GtkToggleButton *tb, gpointer data)
@@ -1034,6 +1156,7 @@ static void on_colour_toggled(GtkToggleButton *tb, gpointer data)
 
         gtk_text_buffer_get_bounds(app->chat_buf, &s, &e);
         gtk_text_buffer_remove_all_tags(app->chat_buf, &s, &e);
+        think_apply_all(app);           /* thinking stays collapsed even raw */
     }
 }
 
@@ -1337,6 +1460,76 @@ static void post_status(App *app, char *text)
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_status_cb, u, ui_text_free);
 }
 
+/*
+ * Thinking regions are opened and closed from the worker thread but the
+ * marks and header text must be created on the main loop, in order with
+ * the surrounding text pieces. These control events ride the same idle
+ * queue as post_text(), so they interleave correctly with the stream.
+ */
+typedef enum {
+    UI_THINK_BEGIN,
+    UI_THINK_END
+} UiEventType;
+
+typedef struct {
+    App        *app;
+    UiEventType type;
+} UiEvent;
+
+static gboolean ui_event_cb(gpointer p)
+{
+    UiEvent *ev = p;
+    App *app = ev->app;
+    GtkTextIter end;
+
+    if (ev->type == UI_THINK_BEGIN) {
+        ThinkBlock *blk = g_new0(ThinkBlock, 1);
+
+        ensure_tags(app);
+        blk->expanded = TRUE;               /* visible while it streams */
+        blk->body_tag = g_strdup_printf("tbody%u", app->think_seq++);
+        gtk_text_buffer_create_tag(app->chat_buf, blk->body_tag,
+            "invisible", FALSE,
+            "style", PANGO_STYLE_ITALIC,
+            "foreground", "#8b949e", NULL);
+
+        gtk_text_buffer_get_end_iter(app->chat_buf, &end);
+        blk->head_start =
+            gtk_text_buffer_create_mark(app->chat_buf, NULL, &end, TRUE);
+        gtk_text_buffer_insert(app->chat_buf, &end,
+                               "\xE2\x96\xBE thinking\n", -1);  /* ▾ header */
+        gtk_text_buffer_get_end_iter(app->chat_buf, &end);
+        blk->body_start =
+            gtk_text_buffer_create_mark(app->chat_buf, NULL, &end, TRUE);
+
+        g_ptr_array_add(app->think_blocks, blk);
+        app->think_current = blk;
+    } else {                                /* UI_THINK_END */
+        ThinkBlock *blk = app->think_current;
+
+        if (blk) {
+            gtk_text_buffer_get_end_iter(app->chat_buf, &end);
+            blk->body_end =
+                gtk_text_buffer_create_mark(app->chat_buf, NULL, &end, TRUE);
+            gtk_text_buffer_insert(app->chat_buf, &end, "\n", -1);
+            blk->expanded = FALSE;          /* collapse once thinking ends */
+            think_set_arrow(app, blk);
+            think_apply_one(app, blk);
+            app->think_current = NULL;
+        }
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void post_event(App *app, UiEventType t)
+{
+    UiEvent *ev = g_new0(UiEvent, 1);
+
+    ev->app = app;
+    ev->type = t;
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_event_cb, ev, g_free);
+}
+
 static void ui_done_free(gpointer p)
 {
     UiDone *d = p;
@@ -1437,14 +1630,14 @@ static void process_chunk_line(Req *r, const char *line)
 
     if (think && *think) {
         if (!r->thinking_open) {
-            post_text(r->app, g_strdup("[thinking] "));
+            post_event(r->app, UI_THINK_BEGIN);
             r->thinking_open = TRUE;
         }
         post_text(r->app, g_strdup(think));
     }
     if (piece && *piece) {
         if (r->thinking_open) {
-            post_text(r->app, g_strdup("\n[/thinking]\n"));
+            post_event(r->app, UI_THINK_END);
             r->thinking_open = FALSE;
         }
         g_string_append(r->acc, piece);
@@ -1551,6 +1744,12 @@ static gpointer req_worker(gpointer data)
     /* non-streaming: the whole response body is one JSON object */
     if (cc == CURLE_OK && !r->streaming && r->pending->len > 0)
         process_chunk_line(r, r->pending->str);
+
+    /* a reply that was pure thinking never saw a content piece — close it */
+    if (r->thinking_open) {
+        post_event(r->app, UI_THINK_END);
+        r->thinking_open = FALSE;
+    }
 
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
@@ -1959,6 +2158,105 @@ static void on_save_chat(GtkButton *b, gpointer data)
     g_object_unref(d);
 }
 
+/* click on a thinking header expands/collapses that block */
+static void on_chat_click(GtkGestureClick *gesture, gint n_press,
+                          gdouble x, gdouble y, gpointer data)
+{
+    App *app = data;
+    GtkTextView *tv = GTK_TEXT_VIEW(app->chat_view);
+    GtkTextIter it, ss, se;
+    gint bx, by, off;
+    guint i;
+
+    (void)gesture;
+    if (n_press != 1)
+        return;
+    /* a live selection means the user was dragging to select, not toggling */
+    if (gtk_text_buffer_get_selection_bounds(app->chat_buf, &ss, &se))
+        return;
+    if (!app->think_blocks || app->think_blocks->len == 0)
+        return;
+
+    gtk_text_view_window_to_buffer_coords(tv, GTK_TEXT_WINDOW_WIDGET,
+                                          (gint)x, (gint)y, &bx, &by);
+    gtk_text_view_get_iter_at_location(tv, &it, bx, by);
+    off = gtk_text_iter_get_offset(&it);
+
+    for (i = 0; i < app->think_blocks->len; i++) {
+        ThinkBlock *blk = g_ptr_array_index(app->think_blocks, i);
+        GtkTextIter hs, bs;
+
+        if (!blk->head_start || !blk->body_start)
+            continue;
+        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &hs, blk->head_start);
+        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &bs, blk->body_start);
+        if (off >= gtk_text_iter_get_offset(&hs) &&
+            off <  gtk_text_iter_get_offset(&bs)) {
+            think_toggle(app, blk);
+            break;
+        }
+    }
+}
+
+/* enable the "Save selection…" button only while something is selected */
+static void on_chat_selection_changed(GtkTextBuffer *buf, GParamSpec *ps,
+                                      gpointer data)
+{
+    App *app = data;
+
+    (void)ps;
+    if (app->save_sel_btn)
+        gtk_widget_set_sensitive(app->save_sel_btn,
+                                 gtk_text_buffer_get_has_selection(buf));
+}
+
+static void on_save_selection_done(GObject *src, GAsyncResult *res,
+                                   gpointer data)
+{
+    App *app = data;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+
+    if (f) {
+        GtkTextIter s, e;
+        GError *err = NULL;
+
+        if (gtk_text_buffer_get_selection_bounds(app->chat_buf, &s, &e)) {
+            char *txt = gtk_text_buffer_get_text(app->chat_buf, &s, &e, FALSE);
+
+            if (g_file_replace_contents(f, txt, strlen(txt), NULL, FALSE,
+                                        G_FILE_CREATE_NONE, NULL, NULL, &err))
+                set_status(app, "Selection saved (%" G_GSIZE_FORMAT " bytes)",
+                           strlen(txt));
+            else {
+                show_error(app, err->message);
+                g_clear_error(&err);
+            }
+            g_free(txt);
+        } else {
+            set_status(app, "Selection was cleared before saving");
+        }
+        g_object_unref(f);
+    }
+}
+
+static void on_save_selection(GtkButton *b, gpointer data)
+{
+    App *app = data;
+    GtkTextIter s, e;
+    GtkFileDialog *d;
+
+    (void)b;
+    if (!gtk_text_buffer_get_selection_bounds(app->chat_buf, &s, &e)) {
+        set_status(app, "Select some text in the chat first");
+        return;
+    }
+    d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, "Save selected text");
+    gtk_file_dialog_set_initial_name(d, "selection.txt");
+    gtk_file_dialog_save(d, app->win, NULL, on_save_selection_done, app);
+    g_object_unref(d);
+}
+
 static void on_new_chat(GtkButton *b, gpointer data)
 {
     App *app = data;
@@ -1970,6 +2268,7 @@ static void on_new_chat(GtkButton *b, gpointer data)
     }
     json_array_unref(app->messages);
     app->messages = json_array_new();
+    think_clear(app);                   /* drop marks/tags before clearing */
     gtk_text_buffer_set_text(app->chat_buf, "", -1);
     g_clear_pointer(&app->last_response, g_free);
     g_clear_pointer(&app->last_payload, g_free);
@@ -3507,6 +3806,7 @@ static void activate(GtkApplication *gapp, gpointer user_data)
     app->attachments = g_ptr_array_new_with_free_func(attachment_free);
     app->messages = json_array_new();
     app->usage = g_ptr_array_new_with_free_func(usage_free);
+    app->think_blocks = g_ptr_array_new_with_free_func(think_block_free);
     load_state(app);                    /* features 4-6: config + ledger */
 
     win = gtk_application_window_new(gapp);
@@ -3681,6 +3981,17 @@ static void activate(GtkApplication *gapp, gpointer user_data)
         "Pick a model on the left, type below, press Send (or Ctrl+Enter).\n",
         -1);
 
+    /* click a "thinking" header to expand/collapse it */
+    {
+        GtkGesture *click = gtk_gesture_click_new();
+
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click),
+                                      GDK_BUTTON_PRIMARY);
+        g_signal_connect(click, "released", G_CALLBACK(on_chat_click), app);
+        gtk_widget_add_controller(app->chat_view,
+                                  GTK_EVENT_CONTROLLER(click));
+    }
+
     chat_sw = gtk_scrolled_window_new();
     gtk_widget_set_vexpand(chat_sw, TRUE);
     gtk_widget_set_hexpand(chat_sw, TRUE);
@@ -3754,6 +4065,14 @@ static void activate(GtkApplication *gapp, gpointer user_data)
 
     copy_btn = gtk_button_new_with_label("Copy reply");
     g_signal_connect(copy_btn, "clicked", G_CALLBACK(on_copy_reply), app);
+    app->save_sel_btn = gtk_button_new_with_label("Save selection…");
+    gtk_widget_set_tooltip_text(app->save_sel_btn,
+        "Save the text currently selected in the chat to a file");
+    gtk_widget_set_sensitive(app->save_sel_btn, FALSE);
+    g_signal_connect(app->save_sel_btn, "clicked",
+                     G_CALLBACK(on_save_selection), app);
+    g_signal_connect(app->chat_buf, "notify::has-selection",
+                     G_CALLBACK(on_chat_selection_changed), app);
     save_btn = gtk_button_new_with_label("Save chat…");
     g_signal_connect(save_btn, "clicked", G_CALLBACK(on_save_chat), app);
     new_btn = gtk_button_new_with_label("New chat");
@@ -3766,6 +4085,7 @@ static void activate(GtkApplication *gapp, gpointer user_data)
     gtk_box_append(GTK_BOX(btn_row), app->code_btn);
     gtk_box_append(GTK_BOX(btn_row), app->points_btn);
     gtk_box_append(GTK_BOX(btn_row), copy_btn);
+    gtk_box_append(GTK_BOX(btn_row), app->save_sel_btn);
     gtk_box_append(GTK_BOX(btn_row), save_btn);
     gtk_box_append(GTK_BOX(btn_row), new_btn);
     gtk_box_append(GTK_BOX(bottom), btn_row);
