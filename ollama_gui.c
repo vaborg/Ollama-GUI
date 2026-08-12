@@ -810,6 +810,16 @@ static void ensure_tags(App *app)
     /* clickable header of a collapsible thinking block */
     gtk_text_buffer_create_tag(app->chat_buf, "thead",
         "weight", PANGO_WEIGHT_BOLD, "foreground", "#6f42c1", NULL);
+    /* per-message alignment: the user's turn is right-justified and sits on a
+     * green paragraph band; the assistant's turn keeps the default (left). */
+    {
+        GtkTextTag *ublock = gtk_text_buffer_create_tag(app->chat_buf, "ublock",
+            "justification", GTK_JUSTIFY_RIGHT,
+            "paragraph-background", "#d4edda", NULL);
+        /* lowest priority, so a fenced code block inside a question keeps its
+         * dark background; justification is set only here, so it still wins. */
+        gtk_text_tag_set_priority(ublock, 0);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1068,7 +1078,9 @@ static void highlight_inline_md(App *app, GtkTextIter *line_start_after_indent,
 static void re_render_chat(App *app)
 {
     GtkTextIter line, s, e, fence_open = { 0 };
+    GtkTextIter ublk_start = { 0 };
     gboolean in_code = FALSE;
+    gboolean in_user = FALSE;
 
     ensure_tags(app);
     gtk_text_buffer_get_bounds(app->chat_buf, &s, &e);
@@ -1122,10 +1134,25 @@ static void re_render_chat(App *app)
             highlight_inline_md(app, &m1, p + mark);
         } else if (g_str_has_prefix(p, "[You")) {
             gtk_text_buffer_apply_tag_by_name(app->chat_buf, "urole", &line, &lend);
+            if (in_user)        /* close a previous (unterminated) question */
+                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
+                                                  &ublk_start, &line);
+            ublk_start = line;  /* this question starts here */
+            in_user = TRUE;
         } else if (g_str_has_prefix(p, "[Assistant")) {
             gtk_text_buffer_apply_tag_by_name(app->chat_buf, "arole", &line, &lend);
+            if (in_user) {      /* the question ends where the answer begins */
+                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
+                                                  &ublk_start, &line);
+                in_user = FALSE;
+            }
         } else if (g_str_has_prefix(p, "[Error")) {
             gtk_text_buffer_apply_tag_by_name(app->chat_buf, "err", &line, &lend);
+            if (in_user) {
+                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
+                                                  &ublk_start, &line);
+                in_user = FALSE;
+            }
         } else if (*p) {
             highlight_inline_md(app, &t0, p);
         }
@@ -1141,6 +1168,13 @@ static void re_render_chat(App *app)
         gtk_text_buffer_get_end_iter(app->chat_buf, &e2);
         gtk_text_buffer_apply_tag_by_name(app->chat_buf, "code", &body, &e2);
         highlight_code(app, &body, &e2);
+    }
+    if (in_user) {                      /* a question with no answer yet */
+        GtkTextIter e2;
+
+        gtk_text_buffer_get_end_iter(app->chat_buf, &e2);
+        gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
+                                          &ublk_start, &e2);
     }
     think_apply_all(app);               /* keep thinking blocks collapsed */
 }
@@ -1983,6 +2017,7 @@ static void send_request(App *app)
         g_free(hdr);
     }
     chat_append(app, "\n[Assistant]\n");
+    finish_render(app);                 /* align the question right away */
 
     base = base_url(app);
     url = g_strdup_printf("%s%s", base, ENDPOINTS[ep]);
