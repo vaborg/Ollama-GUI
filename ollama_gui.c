@@ -1,5 +1,7 @@
 /*
- * ollama_gui.c — desktop client for the Ollama REST API, GTK4 + libcurl + json-glib.
+ * ollama_gui.c — single-file GTK4 chat client for local Ollama and the
+ * cloud APIs of OpenAI, Anthropic and Google Gemini, with a provider
+ * pad for API keys.
  *
  * Build dependencies (Debian/Ubuntu):
  *
@@ -8,20 +10,31 @@
  *
  * Compile:
  *
- *   gcc -O2 -Wall -o ollama-gui ollama_gui.c \
+ *   gcc -O2 -Wall -o cloud-chat ollama_gui.c \
  *       $(pkg-config --cflags --libs gtk4 json-glib-1.0 libcurl)
  *
- * Requires GTK 4.10 or newer (GtkFileDialog, GtkAlertDialog).
+ * Requires GTK 4.10 or newer (GtkAlertDialog) and libcurl 7.32 or
+ * newer (CURLOPT_XFERINFOFUNCTION).
  *
- * Layout: request builder on the left, chat transcript in the centre,
- * composer at the bottom. Every request is assembled as a JsonNode, so
- * "Preview request" prints the exact bytes that will be POSTed.
- *
- * Streaming runs on a worker thread; the libcurl write callback splits the
- * NDJSON stream into lines and hands text to the GTK main loop through
- * g_idle_add(). No GTK call is ever made off the main thread.
- *
- * API reference: https://github.com/ollama/ollama/blob/main/docs/api.md
+ * The canonical conversation format is Ollama's (role/content/images);
+ * it is translated on the wire for each vendor. Streaming runs on a
+ * worker thread; no GTK call is ever made off the main thread.
+ * Attachments: images go out as base64 image parts (PNG/JPEG/GIF/WebP
+ * as-is, other formats re-encoded to PNG); UTF-8 text files are inlined
+ * into the user turn as <file name="...">...</file>. "Save chat" writes
+ * Markdown, or the canonical JSON history when the name ends in .json.
+ * "Save code" writes the fenced code blocks of the latest reply that
+ * has any: one block via a save dialog, several into a chosen folder.
+ * Transcript: your turns are bubbles on the right, replies on the left;
+ * a reply's thinking sits behind a collapsed "+ Thinking" toggle.
+ * Parameters: each sampling parameter has an on/off switch; thinking and
+ * effort can be left at the model default (omitted from the request).
+ * Auto-adapt: when an API answers HTTP 400/422 naming a parameter, that
+ * parameter is remembered as unsupported for that provider/model (saved
+ * in the config, shown under Parameters, resettable) and the turn is
+ * resent without it.
+ * Config: ~/.config/cloud-chat/config.ini (chmod 600). API keys are
+ * stored there in plain text ONLY if "Remember keys" is checked.
  */
 
 #include <gtk/gtk.h>
@@ -30,155 +43,1631 @@
 #include <glib/gstdio.h>
 #include <stdarg.h>
 #include <string.h>
-#include <signal.h>
 
-/* ------------------------------------------------------------------ */
-/* constants                                                          */
-/* ------------------------------------------------------------------ */
+#if GLIB_CHECK_VERSION(2, 74, 0)
+#define APP_FLAGS G_APPLICATION_DEFAULT_FLAGS
+#else
+#define APP_FLAGS G_APPLICATION_FLAGS_NONE
+#endif
 
-static const char *const LOAD_MODES[] = {
-    "auto", "text", "image (base64)", "JSON", "raw -> base64", NULL
-};
-static const char *const OUT_MODES[] = {
-    "free text", "JSON mode", "JSON schema", NULL
-};
-static const char *const ENDPOINTS[] = {
-    "/api/chat", "/api/generate", NULL
-};
+/* bytes of a streamed body kept for HTTP error reports */
+#define ERR_BODY_CAP (64 * 1024)
 
-#define PANE_LEFT_MIN   280
-#define PANE_RIGHT_MIN  360
+/* ================================================================== */
+/*  provider table                                                    */
+/* ================================================================== */
 
 typedef enum {
-    MODE_AUTO = 0,
-    MODE_TEXT,
-    MODE_IMAGE,
-    MODE_JSON,
-    MODE_B64
-} LoadMode;
+    PROV_OLLAMA = 0,     /* local, canonical format */
+    PROV_OPENAI,          /* api.openai.com + any compatible server */
+    PROV_ANTHROPIC,
+    PROV_GOOGLE,
+    PROV_COUNT
+} ProvId;
 
 typedef struct {
-    char    *path;
-    LoadMode mode;
+    const char *id_name;        /* config key            */
+    const char *label;          /* drop-down label       */
+    const char *default_host;
+    const char *default_model;
+} ProvInfo;
+
+static const ProvInfo PROV[PROV_COUNT] = {
+    [PROV_OLLAMA]    = { "ollama",    "Ollama (local)",
+                         "http://localhost:11434", "" },
+    [PROV_OPENAI]    = { "openai",    "OpenAI / compatible",
+                         "https://api.openai.com/v1", "gpt-4o-mini" },
+    [PROV_ANTHROPIC] = { "anthropic", "Anthropic (Claude)",
+                         "https://api.anthropic.com/v1", "claude-sonnet-4-5" },
+    [PROV_GOOGLE]    = { "google",    "Google (Gemini)",
+                         "https://generativelanguage.googleapis.com/v1beta",
+                         "gemini-2.5-flash" },
+};
+
+static const ProvInfo *prov_get(ProvId id)
+{
+    return &PROV[(id < PROV_COUNT) ? id : PROV_OLLAMA];
+}
+
+/* ================================================================== */
+/*  canonical history entry                                           */
+/* ================================================================== */
+
+typedef struct {
+    char     *role;      /* "system" | "user" | "assistant" */
+    char     *text;
+    GPtrArray *images;   /* char* base64, may be NULL */
+} Msg;
+
+static Msg *msg_new(const char *role, const char *text)
+{
+    Msg *m = g_new0(Msg, 1);
+
+    m->role = g_strdup(role ? role : "user");
+    m->text = g_strdup(text ? text : "");
+    return m;
+}
+
+static void msg_free(gpointer p)
+{
+    Msg *m = p;
+
+    g_free(m->role);
+    g_free(m->text);
+    if (m->images)
+        g_ptr_array_unref(m->images);
+    g_free(m);
+}
+
+/* ================================================================== */
+/*  small json helpers                                                */
+/* ================================================================== */
+
+static const char *j_str(JsonObject *o, const char *k)
+{
+    JsonNode *n;
+
+    if (!o || !json_object_has_member(o, k))
+        return NULL;
+    n = json_object_get_member(o, k);
+    return JSON_NODE_HOLDS_VALUE(n) ? json_node_get_string(n) : NULL;
+}
+
+static gint64 j_int(JsonObject *o, const char *k, gint64 d)
+{
+    JsonNode *n;
+
+    if (!o || !json_object_has_member(o, k))
+        return d;
+    n = json_object_get_member(o, k);
+    return JSON_NODE_HOLDS_VALUE(n) ? json_node_get_int(n) : d;
+}
+
+static gboolean j_bool(JsonObject *o, const char *k)
+{
+    JsonNode *n;
+
+    if (!o || !json_object_has_member(o, k))
+        return FALSE;
+    n = json_object_get_member(o, k);
+    return JSON_NODE_HOLDS_VALUE(n) ? json_node_get_boolean(n) : FALSE;
+}
+
+static JsonObject *j_obj(JsonObject *o, const char *k)
+{
+    JsonNode *n;
+
+    if (!o || !json_object_has_member(o, k))
+        return NULL;
+    n = json_object_get_member(o, k);
+    return JSON_NODE_HOLDS_OBJECT(n) ? json_node_get_object(n) : NULL;
+}
+
+static JsonArray *j_arr(JsonObject *o, const char *k)
+{
+    JsonNode *n;
+
+    if (!o || !json_object_has_member(o, k))
+        return NULL;
+    n = json_object_get_member(o, k);
+    return JSON_NODE_HOLDS_ARRAY(n) ? json_node_get_array(n) : NULL;
+}
+
+static char *j_ser(JsonNode *n)
+{
+    JsonGenerator *g = json_generator_new();
+    char *s;
+
+    json_generator_set_root(g, n);
+    s = json_generator_to_data(g, NULL);
+    g_object_unref(g);
+    return s;
+}
+
+/* {"error":"..."} or {"error":{"message":"..."}} -> message */
+static char *err_text(JsonObject *o)
+{
+    JsonNode *n;
+    const char *s = NULL;
+
+    if (!o || !json_object_has_member(o, "error"))
+        return NULL;
+    n = json_object_get_member(o, "error");
+    if (JSON_NODE_HOLDS_VALUE(n))
+        s = json_node_get_string(n);
+    else if (JSON_NODE_HOLDS_OBJECT(n))
+        s = j_str(json_node_get_object(n), "message");
+    return g_strdup(s ? s : "unknown API error");
+}
+
+static char *node_to_string(JsonNode *n, gboolean pretty)
+{
+    JsonGenerator *g = json_generator_new();
+    char *s;
+
+    json_generator_set_root(g, n);
+    json_generator_set_pretty(g, pretty);
+    if (pretty)
+        json_generator_set_indent(g, 2);
+    s = json_generator_to_data(g, NULL);
+    g_object_unref(g);
+    return s;
+}
+
+/* base64 magic bytes -> MIME (attachments carry no extension here) */
+static const char *image_mime(const char *b64)
+{
+    if (!b64)                            return "image/png";
+    if (g_str_has_prefix(b64, "/9j/"))  return "image/jpeg";
+    if (g_str_has_prefix(b64, "R0lGOD")) return "image/gif";
+    if (g_str_has_prefix(b64, "UklGR"))  return "image/webp";
+    return "image/png";
+}
+
+static char *strip_host(const char *host, const char *dflt)
+{
+    char *s;
+    gsize n;
+
+    if (!host || !*host)
+        host = dflt;
+    s = g_strstrip(g_strdup(host));
+    n = strlen(s);
+    while (n && s[n - 1] == '/')
+        s[--n] = '\0';
+    return s;
+}
+
+/* ================================================================== */
+/*  per-provider message builders                                     */
+/* ================================================================== */
+
+/* OpenAI understands "system" natively — pass history through. */
+static JsonArray *openai_messages(GPtrArray *hist)
+{
+    JsonArray *out = json_array_new();
+    guint i, k;
+
+    if (!hist)
+        return out;
+    for (i = 0; i < hist->len; i++) {
+        Msg *m = g_ptr_array_index(hist, i);
+        JsonObject *msg = json_object_new();
+
+        json_object_set_string_member(msg, "role", m->role ? m->role : "user");
+        if (m->images && m->images->len > 0) {
+            JsonArray *parts = json_array_new();
+
+            if (m->text && *m->text) {
+                JsonObject *t = json_object_new();
+                json_object_set_string_member(t, "type", "text");
+                json_object_set_string_member(t, "text", m->text);
+                json_array_add_object_element(parts, t);
+            }
+            for (k = 0; k < m->images->len; k++) {
+                const char *b64 = g_ptr_array_index(m->images, k);
+                JsonObject *img = json_object_new(), *iu = json_object_new();
+                char *url = g_strdup_printf("data:%s;base64,%s",
+                                            image_mime(b64), b64);
+
+                json_object_set_string_member(img, "type", "image_url");
+                json_object_set_string_member(iu, "url", url);
+                json_object_set_object_member(img, "image_url", iu);
+                json_array_add_object_element(parts, img);
+                g_free(url);
+            }
+            json_object_set_array_member(msg, "content", parts);
+        } else {
+            json_object_set_string_member(msg, "content", m->text ? m->text : "");
+        }
+        json_array_add_object_element(out, msg);
+    }
+    return out;
+}
+
+/* Anthropic: system goes top-level, turns must strictly alternate
+ * user/assistant and start with "user" — so consecutive same-role
+ * turns are merged and a leading assistant turn gets a synthetic
+ * user turn in front of it. */
+typedef struct {
+    const char *role;      /* static string */
+    GString    *text;
+    GPtrArray  *imgs;      /* borrowed const char* */
+} ABucket;
+
+static void abucket_free(gpointer p)
+{
+    ABucket *b = p;
+
+    g_string_free(b->text, TRUE);
+    g_ptr_array_unref(b->imgs);
+    g_free(b);
+}
+
+static JsonArray *anthropic_messages(GPtrArray *hist, GString *system)
+{
+    GPtrArray *bk;
+    JsonArray *out = json_array_new();
+    ABucket *cur = NULL;
+    guint i, k;
+
+    if (!hist)
+        return out;
+    bk = g_ptr_array_new_with_free_func(abucket_free);
+    for (i = 0; i < hist->len; i++) {
+        Msg *m = g_ptr_array_index(hist, i);
+        const char *role;
+
+        if (!m->role)
+            continue;
+        if (!strcmp(m->role, "system")) {
+            if (m->text && *m->text) {
+                if (system->len)
+                    g_string_append_c(system, '\n');
+                g_string_append(system, m->text);
+            }
+            continue;
+        }
+        role = strcmp(m->role, "assistant") ? "user" : "assistant";
+        if ((!m->text || !*m->text) && (!m->images || m->images->len == 0))
+            continue;                              /* empty turns rejected */
+        if (!cur || strcmp(cur->role, role)) {
+            cur = g_new0(ABucket, 1);
+            cur->role = role;
+            cur->text = g_string_new(NULL);
+            cur->imgs = g_ptr_array_new();
+            g_ptr_array_add(bk, cur);
+        }
+        if (m->text && *m->text) {
+            if (cur->text->len)
+                g_string_append_c(cur->text, '\n');
+            g_string_append(cur->text, m->text);
+        }
+        if (m->images)
+            for (k = 0; k < m->images->len; k++)
+                g_ptr_array_add(cur->imgs,
+                                (gpointer)g_ptr_array_index(m->images, k));
+    }
+
+    if (bk->len &&
+        strcmp(((ABucket *)g_ptr_array_index(bk, 0))->role, "user")) {
+        ABucket *u = g_new0(ABucket, 1);
+
+        u->role = "user";
+        u->text = g_string_new("Continue this conversation:");
+        u->imgs = g_ptr_array_new();
+        g_ptr_array_insert(bk, 0, u);
+    }
+
+    for (i = 0; i < bk->len; i++) {
+        ABucket *b = g_ptr_array_index(bk, i);
+        JsonObject *msg = json_object_new();
+        JsonArray *content = json_array_new();
+
+        json_object_set_string_member(msg, "role", b->role);
+        if (b->text->len) {
+            JsonObject *t = json_object_new();
+            json_object_set_string_member(t, "type", "text");
+            json_object_set_string_member(t, "text", b->text->str);
+            json_array_add_object_element(content, t);
+        }
+        for (k = 0; k < b->imgs->len; k++) {
+            const char *b64 = g_ptr_array_index(b->imgs, k);
+            JsonObject *ib = json_object_new(), *src = json_object_new();
+
+            json_object_set_string_member(ib, "type", "image");
+            json_object_set_string_member(src, "type", "base64");
+            json_object_set_string_member(src, "media_type", image_mime(b64));
+            json_object_set_string_member(src, "data", b64);
+            json_object_set_object_member(ib, "source", src);
+            json_array_add_object_element(content, ib);
+        }
+        json_object_set_array_member(msg, "content", content);
+        json_array_add_object_element(out, msg);
+    }
+    g_ptr_array_free(bk, TRUE);
+    return out;
+}
+
+/* Gemini: "assistant"->"model", system -> systemInstruction */
+static JsonArray *gemini_contents(GPtrArray *hist, GString *system)
+{
+    JsonArray *out = json_array_new();
+    guint i, k;
+
+    if (!hist)
+        return out;
+    for (i = 0; i < hist->len; i++) {
+        Msg *m = g_ptr_array_index(hist, i);
+        const char *grole;
+        JsonObject *msg;
+        JsonArray *parts;
+
+        if (!m->role)
+            continue;
+        if (!strcmp(m->role, "system")) {
+            if (m->text && *m->text) {
+                if (system->len)
+                    g_string_append_c(system, '\n');
+                g_string_append(system, m->text);
+            }
+            continue;
+        }
+        if ((!m->text || !*m->text) && (!m->images || m->images->len == 0))
+            continue;
+        grole = strcmp(m->role, "assistant") ? "user" : "model";
+
+        msg = json_object_new();
+        json_object_set_string_member(msg, "role", grole);
+        parts = json_array_new();
+        if (m->text && *m->text) {
+            JsonObject *t = json_object_new();
+            json_object_set_string_member(t, "text", m->text);
+            json_array_add_object_element(parts, t);
+        }
+        if (m->images)
+            for (k = 0; k < m->images->len; k++) {
+                const char *b64 = g_ptr_array_index(m->images, k);
+                JsonObject *ip = json_object_new(), *inl = json_object_new();
+
+                json_object_set_string_member(inl, "mime_type", image_mime(b64));
+                json_object_set_string_member(inl, "data", b64);
+                json_object_set_object_member(ip, "inline_data", inl);
+                json_array_add_object_element(parts, ip);
+            }
+        json_object_set_array_member(msg, "parts", parts);
+        json_array_add_object_element(out, msg);
+    }
+    return out;
+}
+
+/* Ollama: verbatim copy of the canonical history */
+static JsonArray *ollama_messages(GPtrArray *hist)
+{
+    JsonArray *out = json_array_new();
+    guint i, k;
+
+    if (!hist)
+        return out;
+    for (i = 0; i < hist->len; i++) {
+        Msg *m = g_ptr_array_index(hist, i);
+        JsonObject *nm = json_object_new();
+
+        json_object_set_string_member(nm, "role", m->role ? m->role : "user");
+        json_object_set_string_member(nm, "content", m->text ? m->text : "");
+        if (m->images && m->images->len) {
+            JsonArray *imgs = json_array_new();
+
+            for (k = 0; k < m->images->len; k++)
+                json_array_add_string_element(imgs,
+                    g_ptr_array_index(m->images, k));
+            json_object_set_array_member(nm, "images", imgs);
+        }
+        json_array_add_object_element(out, nm);
+    }
+    return out;
+}
+
+/* ================================================================== */
+/*  request assembly                                                  */
+/* ================================================================== */
+
+typedef struct {
+    char  *url;
+    char  *body;      /* JSON to POST                        */
+    char **headers;   /* NULL-terminated "Name: value" list */
+    guint  sent;      /* P_* / S_* bits actually put in the body */
+} ProvRequest;
+
+static void header_add(char ***hdrs, const char *fmt, ...)
+{
+    va_list ap;
+    char *line;
+    guint n = 0;
+
+    va_start(ap, fmt);
+    line = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    if (*hdrs)
+        while ((*hdrs)[n])
+            n++;
+    *hdrs = g_renew(char *, *hdrs, n + 2);
+    (*hdrs)[n] = line;
+    (*hdrs)[n + 1] = NULL;
+}
+
+static void prov_request_free(ProvRequest *r)
+{
+    char **h;
+
+    if (!r)
+        return;
+    if (r->headers)
+        for (h = r->headers; *h; h++)
+            g_free(*h);
+    g_free(r->headers);
+    g_free(r->url);
+    g_free(r->body);
+    g_free(r);
+}
+
+/* parameter switches, and per-model quirks learned from HTTP 400s */
+enum {
+    P_TEMP      = 1u << 0,
+    P_TOPP      = 1u << 1,
+    P_MAXTOK    = 1u << 2,
+    P_SEED      = 1u << 3,
+    P_THINK     = 1u << 4,   /* send no thinking config at all          */
+    P_EFFORT    = 1u << 5,
+    P_NO_OFF    = 1u << 6,   /* thinking can't be disabled: Off = omit  */
+    P_LEGACY    = 1u << 7,   /* Anthropic: budget_tokens, not adaptive  */
+    P_MCT       = 1u << 8,   /* OpenAI: max_completion_tokens           */
+    P_NODISPLAY = 1u << 9,   /* Anthropic: no thinking.display          */
+    S_ADAPTIVE  = 1u << 16,  /* sent-only markers for the classifier    */
+    S_DISABLED  = 1u << 17
+};
+#define Q_MASK 0xffffu
+
+enum { THINK_DEFAULT = 0, THINK_ON, THINK_OFF };
+
+static const char *const EFFORTS[] = {
+    NULL, "low", "medium", "high", "xhigh", "max"
+};
+
+typedef struct {
+    gboolean    use_temp, use_topp, use_maxtok, use_seed;
+    double      temp, top_p;
+    int         max_tokens;
+    gint64      seed;
+    int         think;      /* THINK_*                         */
+    const char *effort;     /* NULL = model default (omitted)  */
+    guint       quirks;     /* P_* bits never to send/how to send */
+} GenParams;
+
+/* o1/o3/o4… and gpt-5 refuse "max_tokens" and custom sampling */
+static gboolean openai_reasoner(const char *m)
+{
+    return m && ((m[0] == 'o' && g_ascii_isdigit(m[1])) ||
+                 g_str_has_prefix(m, "gpt-5"));
+}
+
+/* known restrictions, so the first request already goes through;
+ * anything else is learned from the API's own 400 messages */
+static guint builtin_quirks(ProvId id, const char *model)
+{
+    if (!model)
+        return 0;
+    if (id == PROV_ANTHROPIC &&
+        (g_str_has_prefix(model, "claude-fable") ||
+         g_str_has_prefix(model, "claude-mythos")))
+        return P_TEMP | P_TOPP | P_NO_OFF;    /* sampling removed, thinking always on */
+    if (id == PROV_OPENAI && openai_reasoner(model))
+        return P_TEMP | P_TOPP | P_SEED | P_MCT;
+    return 0;
+}
+
+/* Which of the parameters we sent does this error message complain
+ * about? Returns only bits not already in `quirks`. */
+static guint classify_rejection(ProvId id, const char *msg, guint sent,
+                                guint quirks)
+{
+    char *m = g_ascii_strdown(msg ? msg : "", -1);
+    guint add = 0;
+
+    if ((sent & P_TOPP) &&
+        (strstr(m, "top_p") || strstr(m, "topp") || strstr(m, "top-p")))
+        add |= P_TOPP;
+    /* "temperature and top_p cannot both be specified": top_p is enough */
+    if ((sent & P_TEMP) && strstr(m, "temperature") &&
+        !((add & P_TOPP) && strstr(m, "both")))
+        add |= P_TEMP;
+    if ((sent & P_SEED) && strstr(m, "seed"))
+        add |= P_SEED;
+    if ((sent & P_EFFORT) && strstr(m, "effort"))
+        add |= P_EFFORT;
+    if ((sent & P_MAXTOK) && id != PROV_ANTHROPIC) {    /* required there */
+        if (id == PROV_OPENAI && !(quirks & P_MCT) &&
+            strstr(m, "max_completion_tokens"))
+            add |= P_MCT;
+        else if (strstr(m, "max_tokens") || strstr(m, "max_completion_tokens") ||
+                 strstr(m, "maxoutputtokens") || strstr(m, "num_predict"))
+            add |= P_MAXTOK;
+    }
+    if (sent & P_THINK) {
+        if ((sent & S_DISABLED) &&
+            (strstr(m, "disabled") || strstr(m, "budget 0") ||
+             strstr(m, "thinking mode") || strstr(m, "cannot be disabled")))
+            add |= P_NO_OFF;
+        else if ((sent & S_ADAPTIVE) && strstr(m, "display"))
+            add |= P_NODISPLAY;
+        else if ((sent & S_ADAPTIVE) && strstr(m, "adaptive"))
+            add |= P_LEGACY;
+        else if (strstr(m, "think") || strstr(m, "budget"))
+            add |= P_THINK;
+    }
+    g_free(m);
+    return add & ~quirks & Q_MASK;
+}
+
+static ProvRequest *prov_build_request(ProvId id, const char *host,
+                                       const char *model, const char *key,
+                                       gboolean stream, const GenParams *gp,
+                                       GPtrArray *hist)
+{
+    ProvRequest *r = g_new0(ProvRequest, 1);
+    JsonObject *root = json_object_new();
+    JsonNode *node;
+    GString *system = g_string_new(NULL);
+    char **h = NULL;
+    char *base = strip_host(host, prov_get(id)->default_host);
+    const guint q = gp->quirks;
+    const gboolean temp_on = gp->use_temp && !(q & P_TEMP) && gp->temp >= 0.0;
+    const gboolean topp_on = gp->use_topp && !(q & P_TOPP) &&
+                             gp->top_p > 0.0 && gp->top_p <= 1.0;
+    const gboolean max_on  = gp->use_maxtok && !(q & P_MAXTOK) &&
+                             gp->max_tokens > 0;
+    const gboolean seed_on = gp->use_seed && !(q & P_SEED) && gp->seed >= 0;
+    const char *effort = (q & P_EFFORT) ? NULL : gp->effort;
+    const int think = (q & P_THINK) ? THINK_DEFAULT
+                    : (gp->think == THINK_OFF && (q & P_NO_OFF)) ? THINK_DEFAULT
+                    : gp->think;
+    guint sent = 0;
+
+    if (!model || !*model)
+        model = prov_get(id)->default_model;
+    header_add(&h, "Content-Type: application/json");
+    header_add(&h, "Expect:");           /* skip 100-continue pauses */
+
+    switch (id) {
+    case PROV_OPENAI:
+        if (key && *key)                  /* LM Studio/llama.cpp run keyless */
+            header_add(&h, "Authorization: Bearer %s", key);
+        r->url = g_strdup_printf("%s/chat/completions", base);
+        json_object_set_string_member(root, "model", model);
+        json_object_set_array_member(root, "messages", openai_messages(hist));
+        json_object_set_boolean_member(root, "stream", stream);
+        if (max_on) {
+            json_object_set_int_member(root,
+                (q & P_MCT) ? "max_completion_tokens" : "max_tokens",
+                gp->max_tokens);
+            sent |= P_MAXTOK;
+        }
+        if (temp_on) {
+            json_object_set_double_member(root, "temperature", gp->temp);
+            sent |= P_TEMP;
+        }
+        if (topp_on) {
+            json_object_set_double_member(root, "top_p", gp->top_p);
+            sent |= P_TOPP;
+        }
+        if (seed_on) {
+            json_object_set_int_member(root, "seed", gp->seed);
+            sent |= P_SEED;
+        }
+        if (effort) {                     /* OpenAI tops out at "high" */
+            json_object_set_string_member(root, "reasoning_effort",
+                (!strcmp(effort, "xhigh") || !strcmp(effort, "max"))
+                    ? "high" : effort);
+            sent |= P_EFFORT;
+        }
+        if (stream && strstr(base, "openai.com")) {
+            JsonObject *so = json_object_new();
+            json_object_set_boolean_member(so, "include_usage", TRUE);
+            json_object_set_object_member(root, "stream_options", so);
+        }
+        break;
+
+    case PROV_ANTHROPIC: {
+        /* max_tokens is required; thinking counts against it */
+        int maxtok = max_on ? gp->max_tokens
+                            : (think == THINK_ON ? 16000 : 8192);
+
+        if (key && *key)
+            header_add(&h, "x-api-key: %s", key);
+        header_add(&h, "anthropic-version: 2023-06-01");
+        r->url = g_strdup_printf("%s/messages", base);
+        json_object_set_string_member(root, "model", model);
+        json_object_set_array_member(root, "messages",
+                                     anthropic_messages(hist, system));
+        if (system->len)
+            json_object_set_string_member(root, "system", system->str);
+        if (max_on)
+            sent |= P_MAXTOK;
+        if (think == THINK_ON) {
+            JsonObject *th = json_object_new();
+
+            if (q & P_LEGACY) {           /* pre-4.6 models: fixed budget */
+                int budget = MAX(1024, MIN(maxtok / 2, 8192));
+
+                if (maxtok <= budget)
+                    maxtok = budget + 4096;
+                json_object_set_string_member(th, "type", "enabled");
+                json_object_set_int_member(th, "budget_tokens", budget);
+            } else {                      /* current models: adaptive */
+                json_object_set_string_member(th, "type", "adaptive");
+                if (!(q & P_NODISPLAY))
+                    json_object_set_string_member(th, "display", "summarized");
+                sent |= S_ADAPTIVE;
+            }
+            json_object_set_object_member(root, "thinking", th);
+            sent |= P_THINK;
+        } else if (think == THINK_OFF) {
+            JsonObject *th = json_object_new();
+
+            json_object_set_string_member(th, "type", "disabled");
+            json_object_set_object_member(root, "thinking", th);
+            sent |= P_THINK | S_DISABLED;
+        }
+        json_object_set_int_member(root, "max_tokens", maxtok);
+        json_object_set_boolean_member(root, "stream", stream);
+        /* no sampling with thinking on; and one of temperature / top_p,
+         * since Claude 4.5 and later reject the two together */
+        if (think != THINK_ON) {
+            if (temp_on) {
+                json_object_set_double_member(root, "temperature",
+                                              CLAMP(gp->temp, 0.0, 1.0));
+                sent |= P_TEMP;
+            } else if (topp_on) {
+                json_object_set_double_member(root, "top_p", gp->top_p);
+                sent |= P_TOPP;
+            }
+        }
+        if (effort) {
+            JsonObject *oc = json_object_new();
+
+            json_object_set_string_member(oc, "effort", effort);
+            json_object_set_object_member(root, "output_config", oc);
+            sent |= P_EFFORT;
+        }
+        break;
+    }
+
+    case PROV_GOOGLE: {
+        /* thinkingConfig exists on 2.5 / 3.x model names only */
+        gboolean tcfg = strstr(model, "2.5") || strstr(model, "-3");
+        JsonObject *gc = json_object_new();
+
+        if (key && *key)
+            header_add(&h, "x-goog-api-key: %s", key);
+        r->url = g_strdup_printf("%s/models/%s:%s%s", base, model,
+                                 stream ? "streamGenerateContent"
+                                        : "generateContent",
+                                 stream ? "?alt=sse" : "");
+        json_object_set_array_member(root, "contents",
+                                     gemini_contents(hist, system));
+        if (system->len) {
+            JsonObject *si = json_object_new();
+            JsonArray *parts = json_array_new();
+            JsonObject *p = json_object_new();
+
+            json_object_set_string_member(p, "text", system->str);
+            json_array_add_object_element(parts, p);
+            json_object_set_array_member(si, "parts", parts);
+            json_object_set_object_member(root, "systemInstruction", si);
+        }
+        if (temp_on) {
+            json_object_set_double_member(gc, "temperature", gp->temp);
+            sent |= P_TEMP;
+        }
+        if (topp_on) {
+            json_object_set_double_member(gc, "topP", gp->top_p);
+            sent |= P_TOPP;
+        }
+        if (max_on) {
+            json_object_set_int_member(gc, "maxOutputTokens", gp->max_tokens);
+            sent |= P_MAXTOK;
+        }
+        if (seed_on) {
+            json_object_set_int_member(gc, "seed", gp->seed);
+            sent |= P_SEED;
+        }
+        /* Pro models cannot switch thinking off (budget 0 -> HTTP 400);
+         * only Flash / Flash-Lite accept it. */
+        if (tcfg && (think == THINK_ON ||
+                     (think == THINK_OFF && strstr(model, "flash")))) {
+            JsonObject *tc = json_object_new();
+
+            json_object_set_int_member(tc, "thinkingBudget",
+                                       think == THINK_ON ? -1 : 0);
+            if (think == THINK_ON)
+                json_object_set_boolean_member(tc, "includeThoughts", TRUE);
+            json_object_set_object_member(gc, "thinkingConfig", tc);
+            sent |= P_THINK | (think == THINK_OFF ? S_DISABLED : 0);
+        }
+        json_object_set_object_member(root, "generationConfig", gc);
+        break;
+    }
+
+    default: {                           /* Ollama, canonical format */
+        JsonObject *opt = json_object_new();
+
+        r->url = g_strdup_printf("%s/api/chat", base);
+        json_object_set_string_member(root, "model", model);
+        json_object_set_array_member(root, "messages", ollama_messages(hist));
+        json_object_set_boolean_member(root, "stream", stream);
+        if (think != THINK_DEFAULT) {
+            json_object_set_boolean_member(root, "think", think == THINK_ON);
+            sent |= P_THINK | (think == THINK_OFF ? S_DISABLED : 0);
+        }
+        if (temp_on) {
+            json_object_set_double_member(opt, "temperature", gp->temp);
+            sent |= P_TEMP;
+        }
+        if (topp_on) {
+            json_object_set_double_member(opt, "top_p", gp->top_p);
+            sent |= P_TOPP;
+        }
+        if (max_on) {
+            json_object_set_int_member(opt, "num_predict", gp->max_tokens);
+            sent |= P_MAXTOK;
+        }
+        if (seed_on) {
+            json_object_set_int_member(opt, "seed", gp->seed);
+            sent |= P_SEED;
+        }
+        json_object_set_object_member(root, "options", opt);
+        break;
+    }
+    }
+
+    node = json_node_new(JSON_NODE_OBJECT);
+    json_node_take_object(node, root);
+    r->body = j_ser(node);
+    json_node_unref(node);
+    r->headers = h;
+    r->sent = sent;
+    g_string_free(system, TRUE);
+    g_free(base);
+    return r;
+}
+
+/* ================================================================== */
+/*  reply parsing (stream + whole body)                               */
+/* ================================================================== */
+
+typedef struct {
+    ProvId      id;
+    gint64      in_tok, out_tok;
+    char       *error;
+    JsonParser *jp;             /* reused for every streamed line */
+} ProvParser;
+
+static ProvParser *prov_parser_new(ProvId id)
+{
+    ProvParser *p = g_new0(ProvParser, 1);
+
+    p->id = id;
+    p->in_tok = p->out_tok = -1;
+    p->jp = json_parser_new();
+    return p;
+}
+
+static void prov_parser_free(ProvParser *p)
+{
+    if (!p)
+        return;
+    g_object_unref(p->jp);
+    g_free(p->error);
+    g_free(p);
+}
+
+static const char *prov_parser_error(const ProvParser *p)
+{
+    return p ? p->error : NULL;
+}
+
+static void prov_parser_usage(const ProvParser *p, gint64 *in_tok, gint64 *out_tok)
+{
+    if (in_tok)
+        *in_tok = p ? p->in_tok : -1;
+    if (out_tok)
+        *out_tok = p ? p->out_tok : -1;
+}
+
+/* Gemini: text vs. thought is decided per part by the "thought" flag */
+static void gemini_collect(JsonObject *o, GString *text, GString *think)
+{
+    JsonArray *cand = j_arr(o, "candidates");
+
+    if (cand && json_array_get_length(cand) > 0) {
+        JsonArray *parts = j_arr(j_obj(json_array_get_object_element(cand, 0),
+                                       "content"), "parts");
+        guint k;
+
+        if (parts)
+            for (k = 0; k < json_array_get_length(parts); k++) {
+                JsonObject *pt = json_array_get_object_element(parts, k);
+                const char *t = j_str(pt, "text");
+
+                if (!t || !*t)
+                    continue;
+                if (j_bool(pt, "thought")) {
+                    if (think)
+                        g_string_append(think, t);
+                } else if (text) {
+                    g_string_append(text, t);
+                }
+            }
+    }
+}
+
+/* Feed one line (NDJSON line or SSE "data:" line). */
+static gboolean prov_parser_feed(ProvParser *p, const char *line,
+                                 GString *text, GString *think)
+{
+    const char *s = line ? line : "";
+    JsonParser *jp;
+    JsonNode *rn;
+    JsonObject *o;
+    char *e;
+
+    while (*s == ' ' || *s == '\t' || *s == '\r')
+        s++;
+    if (!*s)
+        return TRUE;
+
+    if (p->id != PROV_OLLAMA) {
+        if (*s == ':')
+            return TRUE;                    /* SSE keep-alive    */
+        if (!g_str_has_prefix(s, "data:"))
+            return TRUE;                    /* "event:" lines   */
+        s += 5;
+        while (*s == ' ')
+            s++;
+        if (!*s)
+            return TRUE;
+        if (!strcmp(s, "[DONE]"))
+            return TRUE;                    /* OpenAI terminator */
+    }
+
+    jp = p->jp;
+    if (!json_parser_load_from_data(jp, s, -1, NULL))
+        return TRUE;                       /* tolerate noise */
+    rn = json_parser_get_root(jp);
+    if (!rn || !JSON_NODE_HOLDS_OBJECT(rn))
+        return TRUE;
+    o = json_node_get_object(rn);
+
+    e = err_text(o);
+    if (e) {
+        g_free(p->error);
+        p->error = e;
+        return FALSE;
+    }
+
+    switch (p->id) {
+    case PROV_OPENAI: {
+        JsonArray *ch = j_arr(o, "choices");
+        JsonObject *u = j_obj(o, "usage");
+
+        if (ch && json_array_get_length(ch) > 0) {
+            JsonObject *d = j_obj(json_array_get_object_element(ch, 0), "delta");
+            const char *t = j_str(d, "content");
+            const char *r = j_str(d, "reasoning_content");
+
+            if (!r)
+                r = j_str(d, "reasoning");   /* OpenRouter/DeepSeek */
+            if (t && *t && text)
+                g_string_append(text, t);
+            if (r && *r && think)
+                g_string_append(think, r);
+        }
+        if (u) {
+            p->in_tok  = j_int(u, "prompt_tokens", p->in_tok);
+            p->out_tok = j_int(u, "completion_tokens", p->out_tok);
+        }
+        break;
+    }
+    case PROV_ANTHROPIC: {
+        const char *type = j_str(o, "type");
+
+        if (type && !strcmp(type, "message_start")) {
+            JsonObject *u = j_obj(j_obj(o, "message"), "usage");
+            p->in_tok = j_int(u, "input_tokens", p->in_tok);
+        } else if (type && !strcmp(type, "content_block_delta")) {
+            JsonObject *d = j_obj(o, "delta");
+            const char *dt = j_str(d, "type");
+
+            if (dt && !strcmp(dt, "text_delta")) {
+                const char *t = j_str(d, "text");
+                if (t && text)
+                    g_string_append(text, t);
+            } else if (dt && !strcmp(dt, "thinking_delta")) {
+                const char *t = j_str(d, "thinking");
+                if (t && think)
+                    g_string_append(think, t);
+            }
+        } else if (type && !strcmp(type, "message_delta")) {
+            JsonObject *u = j_obj(o, "usage");
+            p->out_tok = j_int(u, "output_tokens", p->out_tok);
+        }
+        break;
+    }
+    case PROV_GOOGLE: {
+        JsonObject *um = j_obj(o, "usageMetadata");
+
+        gemini_collect(o, text, think);
+        if (!j_arr(o, "candidates")) {
+            const char *br = j_str(j_obj(o, "promptFeedback"), "blockReason");
+            if (br) {
+                g_free(p->error);
+                p->error = g_strdup_printf("request blocked: %s", br);
+                return FALSE;
+            }
+        }
+        if (um) {
+            p->in_tok  = j_int(um, "promptTokenCount", p->in_tok);
+            p->out_tok = j_int(um, "candidatesTokenCount", p->out_tok);
+        }
+        break;
+    }
+    default: {                              /* Ollama NDJSON */
+        const char *resp = j_str(o, "response");
+        JsonObject *m = j_obj(o, "message");
+
+        if (resp && *resp && text)
+            g_string_append(text, resp);
+        if (m) {
+            const char *t  = j_str(m, "content");
+            const char *th = j_str(m, "thinking");
+            if (t && *t && text)
+                g_string_append(text, t);
+            if (th && *th && think)
+                g_string_append(think, th);
+        }
+        if (j_bool(o, "done")) {
+            p->in_tok  = j_int(o, "prompt_eval_count", p->in_tok);
+            p->out_tok = j_int(o, "eval_count", p->out_tok);
+        }
+        break;
+    }
+    }
+    return TRUE;
+}
+
+/* whole-body parse for stream = FALSE */
+static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
+                                 GString *text, GString *think,
+                                 gint64 *in_tok, gint64 *out_tok, char **error)
+{
+    JsonParser *jp;
+    JsonNode *rn;
+    JsonObject *o;
+    char *e;
+
+    if (in_tok)
+        *in_tok = -1;
+    if (out_tok)
+        *out_tok = -1;
+
+    jp = json_parser_new();
+    if (!json_parser_load_from_data(jp, body ? body : "", (gssize)len, NULL)) {
+        g_object_unref(jp);
+        if (error)
+            *error = g_strdup("invalid JSON in response body");
+        return FALSE;
+    }
+    rn = json_parser_get_root(jp);
+    if (!rn || !JSON_NODE_HOLDS_OBJECT(rn)) {
+        g_object_unref(jp);
+        if (error)
+            *error = g_strdup("unexpected response shape");
+        return FALSE;
+    }
+    o = json_node_get_object(rn);
+
+    e = err_text(o);
+    if (e) {
+        g_object_unref(jp);
+        if (error)
+            *error = e;
+        else
+            g_free(e);
+        return FALSE;
+    }
+
+    switch (id) {
+    case PROV_OPENAI: {
+        JsonArray *ch = j_arr(o, "choices");
+        JsonObject *m = NULL, *u = j_obj(o, "usage");
+        const char *t, *r;
+
+        if (ch && json_array_get_length(ch) > 0)
+            m = j_obj(json_array_get_object_element(ch, 0), "message");
+        t = j_str(m, "content");
+        r = j_str(m, "reasoning_content");
+        if (!r)
+            r = j_str(m, "reasoning");
+        if (t && text)
+            g_string_append(text, t);
+        if (r && think)
+            g_string_append(think, r);
+        if (u) {
+            if (in_tok)
+                *in_tok = j_int(u, "prompt_tokens", -1);
+            if (out_tok)
+                *out_tok = j_int(u, "completion_tokens", -1);
+        }
+        break;
+    }
+    case PROV_ANTHROPIC: {
+        JsonArray *c = j_arr(o, "content");
+        JsonObject *u = j_obj(o, "usage");
+        guint k;
+
+        if (c)
+            for (k = 0; k < json_array_get_length(c); k++) {
+                JsonObject *b = json_array_get_object_element(c, k);
+                const char *ty = j_str(b, "type");
+
+                if (ty && !strcmp(ty, "text")) {
+                    const char *t = j_str(b, "text");
+                    if (t && text)
+                        g_string_append(text, t);
+                } else if (ty && !strcmp(ty, "thinking")) {
+                    const char *t = j_str(b, "thinking");
+                    if (t && think)
+                        g_string_append(think, t);
+                }
+            }
+        if (u) {
+            if (in_tok)
+                *in_tok = j_int(u, "input_tokens", -1);
+            if (out_tok)
+                *out_tok = j_int(u, "output_tokens", -1);
+        }
+        break;
+    }
+    case PROV_GOOGLE: {
+        JsonObject *um = j_obj(o, "usageMetadata");
+        JsonObject *pf = j_obj(o, "promptFeedback");
+        const char *br = pf ? j_str(pf, "blockReason") : NULL;
+
+        gemini_collect(o, text, think);
+        if (br) {
+            g_object_unref(jp);
+            if (error)
+                *error = g_strdup_printf("request blocked: %s", br);
+            return FALSE;
+        }
+        if (um) {
+            if (in_tok)
+                *in_tok = j_int(um, "promptTokenCount", -1);
+            if (out_tok)
+                *out_tok = j_int(um, "candidatesTokenCount", -1);
+        }
+        break;
+    }
+    default: {                              /* Ollama */
+        const char *resp = j_str(o, "response");
+        JsonObject *m = j_obj(o, "message");
+
+        if (resp && text)
+            g_string_append(text, resp);
+        if (m) {
+            const char *t  = j_str(m, "content");
+            const char *th = j_str(m, "thinking");
+            if (t && text)
+                g_string_append(text, t);
+            if (th && think)
+                g_string_append(think, th);
+        }
+        if (in_tok)
+            *in_tok = j_int(o, "prompt_eval_count", -1);
+        if (out_tok)
+            *out_tok = j_int(o, "eval_count", -1);
+        break;
+    }
+    }
+    g_object_unref(jp);
+    return TRUE;
+}
+
+/* pull a {"error":…} out of an HTTP error body */
+static char *body_error(const char *body, gsize len)
+{
+    JsonParser *p = json_parser_new();
+    char *msg = NULL;
+
+    if (json_parser_load_from_data(p, body ? body : "", (gssize)len, NULL)) {
+        JsonNode *rn = json_parser_get_root(p);
+
+        if (rn && JSON_NODE_HOLDS_OBJECT(rn))
+            msg = err_text(json_node_get_object(rn));
+    }
+    g_object_unref(p);
+    return msg;
+}
+
+/* ================================================================== */
+/*  model inventory                                                   */
+/* ================================================================== */
+
+typedef struct {
+    char  *url;
+    char **headers;
+} ProvListReq;
+
+static void prov_list_req_free(ProvListReq *r)
+{
+    char **h;
+
+    if (!r)
+        return;
+    if (r->headers)
+        for (h = r->headers; *h; h++)
+            g_free(*h);
+    g_free(r->headers);
+    g_free(r->url);
+    g_free(r);
+}
+
+static ProvListReq *prov_list_models(ProvId id, const char *host, const char *key)
+{
+    ProvListReq *r = g_new0(ProvListReq, 1);
+    char **h = NULL;
+    char *base = strip_host(host, prov_get(id)->default_host);
+
+    header_add(&h, "Accept: application/json");
+    switch (id) {
+    case PROV_OPENAI:
+        r->url = g_strdup_printf("%s/models", base);
+        if (key && *key)
+            header_add(&h, "Authorization: Bearer %s", key);
+        break;
+    case PROV_ANTHROPIC:
+        r->url = g_strdup_printf("%s/models?limit=1000", base);
+        if (key && *key)
+            header_add(&h, "x-api-key: %s", key);
+        header_add(&h, "anthropic-version: 2023-06-01");
+        break;
+    case PROV_GOOGLE:
+        r->url = g_strdup_printf("%s/models?pageSize=1000", base);
+        if (key && *key)
+            header_add(&h, "x-goog-api-key: %s", key);
+        break;
+    default:
+        r->url = g_strdup_printf("%s/api/tags", base);
+        break;
+    }
+    r->headers = h;
+    g_free(base);
+    return r;
+}
+
+static gint cmp_str(gconstpointer a, gconstpointer b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static char **finish_models(GPtrArray *a)
+{
+    g_ptr_array_sort(a, cmp_str);
+    g_ptr_array_add(a, NULL);
+    return (char **)g_ptr_array_free(a, FALSE);   /* g_strfreev() it */
+}
+
+static char **prov_parse_models(ProvId id, const char *body, gsize len)
+{
+    GPtrArray *out = g_ptr_array_new_with_free_func(g_free);
+    JsonParser *jp = json_parser_new();
+    JsonNode *rn;
+    JsonObject *o;
+    JsonArray *arr = NULL;
+    guint i, k;
+
+    if (json_parser_load_from_data(jp, body ? body : "", (gssize)len, NULL)) {
+        rn = json_parser_get_root(jp);
+        if (rn && JSON_NODE_HOLDS_OBJECT(rn)) {
+            o = json_node_get_object(rn);
+            arr = j_arr(o, "models");
+            if (!arr)
+                arr = j_arr(o, "data");   /* openai / anthropic */
+        }
+    }
+    if (arr)
+        for (i = 0; i < json_array_get_length(arr); i++) {
+            JsonObject *m = json_array_get_object_element(arr, i);
+            const char *name = (id == PROV_OPENAI || id == PROV_ANTHROPIC)
+                               ? j_str(m, "id") : j_str(m, "name");
+
+            if (!name || !*name)
+                continue;
+            if (id == PROV_GOOGLE) {
+                JsonArray *meth = j_arr(m, "supportedGenerationMethods");
+                gboolean chat = FALSE;
+
+                if (meth)
+                    for (k = 0; k < json_array_get_length(meth); k++)
+                        if (!g_strcmp0(json_array_get_string_element(meth, k),
+                                    "generateContent")) {
+                            chat = TRUE;
+                            break;
+                        }
+                if (!chat)
+                    continue;
+                if (g_str_has_prefix(name, "models/"))
+                    name += strlen("models/");
+            }
+            if (id == PROV_OPENAI) {      /* skip non-chat models */
+                static const char *skip[] = {
+                    "dall-e", "whisper", "tts", "embedding", "moderation",
+                    "transcribe", "realtime", "audio", "image", NULL
+                };
+                const char **sp;
+                gboolean bad = FALSE;
+
+                for (sp = skip; *sp; sp++)
+                    if (strstr(name, *sp)) {
+                        bad = TRUE;
+                        break;
+                    }
+                if (bad)
+                    continue;
+            }
+            g_ptr_array_add(out, g_strdup(name));
+        }
+    g_object_unref(jp);
+    return finish_models(out);
+}
+
+/* ================================================================== */
+/*  application state                                                 */
+/* ================================================================== */
+
+typedef struct App App;
+
+typedef struct {
+    char    *name;       /* basename: display and <file name="..."> */
+    gboolean image;
+    char    *data;       /* base64 (image) or UTF-8 text             */
+    gsize    bytes;      /* size on disk                             */
 } Attachment;
 
-typedef struct {
-    char    *model;
-    gboolean cloud;              /* billed: cloud tag, or host ollama.com */
-    gint64   requests;
-    gint64   prompt_tokens;
-    gint64   eval_tokens;
-} Usage;
-
-/* one collapsible "thinking" region in the transcript */
-typedef struct {
-    GtkTextMark *head_start;   /* start of the clickable header line   */
-    GtkTextMark *body_start;   /* first char of the thinking body      */
-    GtkTextMark *body_end;     /* one past the last char of the body   */
-    char        *body_tag;     /* unique tag name carrying "invisible" */
-    gboolean     expanded;     /* TRUE = body shown, FALSE = collapsed */
-} ThinkBlock;
 
 typedef struct {
+    App         *app;
+    ProvRequest *req;
+    ProvId       prov;
+    gboolean     stream;
+    gint         refs;         /* g_atomic: done path + one queued flush */
+    gint         cancel;       /* g_atomic access */
+    gboolean     cancelled;    /* worker thread only, until done */
+    ProvParser  *parser;
+    GString     *pending;      /* stream line buffer */
+    GString     *full;         /* body; streams keep the first ERR_BODY_CAP */
+    GString     *line_txt, *line_thk;   /* per-line scratch (worker) */
+    char        *error;
+    gint64       in_tok, out_tok;
+    long         http_code;
+    char        *qkey;         /* "provider/model" the quirks belong to */
+    guint        quirks;       /* quirks in force for this request */
+    guint        retries;      /* auto-adapt resends so far */
+
+    /* worker -> main loop handoff, coalesced into one idle at a time */
+    GMutex       q_lock;
+    GString     *q_text, *q_think;
+    gboolean     q_scheduled;
+} Worker;
+
+struct App {
     GtkWindow     *win;
-    GtkWidget     *host_entry;
-    GtkWidget     *model_dd;
-    GtkWidget     *endpoint_dd;
-    GtkWidget     *format_dd;
-    GtkWidget     *loadmode_dd;
+
+    /* provider pad */
+    GtkWidget     *prov_dd, *key_e, *host_e, *remember_cb;
+    ProvId         prov_id;
+    char          *keys[PROV_COUNT];
+    char          *hosts[PROV_COUNT];
+
+    /* model + parameters */
+    GtkWidget     *model_entry, *model_dd;
     GtkStringList *model_list;
-
+    GPtrArray     *models;           /* char* */
+    GtkWidget     *temp_e, *topp_e, *maxtok_e, *seed_e;
+    GtkWidget     *temp_cb, *topp_cb, *maxtok_cb, *seed_cb;   /* send it? */
+    GtkWidget     *think_dd, *effort_dd, *adapt_cb;
+    GtkWidget     *quirk_label, *quirk_reset;
+    GHashTable    *quirks;            /* "provider/model" -> learned P_* */
+    GtkWidget     *stream_cb, *newchat_btn;
     GtkTextBuffer *sys_buf;
-    GtkTextBuffer *schema_buf;
-    GtkTextBuffer *chat_buf;
+
+    /* chat */
+    GtkWidget     *chat_box;          /* vertical list of bubbles */
+    GtkAdjustment *chat_adj;
+    gboolean       follow;            /* keep the view pinned to the end */
     GtkTextBuffer *input_buf;
-    GtkTextBuffer *attach_buf;
-    GtkWidget     *chat_view;
-    GtkTextMark   *end_mark;
+    GtkWidget     *send_btn, *stop_btn, *spinner, *status;
 
-    GtkWidget *temp_e, *topp_e, *ctx_e, *npred_e, *seed_e, *keep_e, *limit_e;
-    GtkWidget *stream_cb, *think_cb, *hist_cb, *ground_cb;
-    GtkWidget *send_btn, *stop_btn, *spinner, *status;
+    /* state */
+    GPtrArray     *history;           /* Msg* */
+    GString       *reply_acc;
+    gboolean       busy;
+    GtkWidget     *cur_box;           /* reply bubble being streamed */
+    GtkTextBuffer *cur_think_buf, *cur_text_buf;   /* NULL until needed */
+    Worker        *worker;
+    gint64         total_in, total_out, requests;
+    gboolean       quiet;             /* programmatic entry updates */
+    gboolean       closing;           /* window gone: idles skip the UI */
+    guint          save_id;           /* debounced config save */
 
-    GPtrArray *models;       /* char*       */
-    GPtrArray *attachments;  /* Attachment* */
-    JsonArray *messages;     /* conversation history */
+    /* attachments + saving */
+    GPtrArray     *att;               /* Attachment*, sent with next turn */
+    GtkWidget     *att_label, *att_clear_btn, *code_btn;
 
-    char *last_response;
-    char *last_payload;
+    /* config staging (loaded before widgets exist) */
+    int            cfg_provider;
+    char          *cfg_model;
+    double         cfg_temp, cfg_topp;
+    gint64         cfg_maxtok, cfg_seed;
+    gboolean       cfg_stream, cfg_remember, cfg_adapt;
+    gboolean       cfg_use_temp, cfg_use_topp, cfg_use_maxtok, cfg_use_seed;
+    int            cfg_think, cfg_effort;
+};
 
-    volatile gint cancel;
-    gboolean      busy;
+/* ================================================================== */
+/*  small UI helpers                                                  */
+/* ================================================================== */
 
-    GtkWidget *paned;
-    GtkWidget *ptr_cb;
-
-    GtkWidget *code_btn, *points_btn;
-    GtkWidget *save_sel_btn;     /* enabled only while chat text is selected */
-
-    GtkWidget *colour_cb;
-    gboolean   tags_ready;
-
-    /* collapsible "thinking" blocks in the transcript */
-    GPtrArray  *think_blocks;   /* ThinkBlock*                          */
-    ThinkBlock *think_current;  /* block being streamed, or NULL        */
-    guint       think_seq;      /* ever-increasing id for unique tags   */
-
-    GtkWidget   *serve_cmd_e, *signin_cmd_e, *apikey_entry, *remember_key_cb;
-    GtkWidget   *serve_btn, *serve_stop_btn, *version_label;
-    GtkTextBuffer *log_buf;
-    GSubprocess *server_proc;
-
-    GtkWidget     *pull_entry, *pull_btn, *pull_bar, *pull_status;
-    GtkTextBuffer *models_buf;
-    volatile gint  pull_cancel;
-    gboolean       pulling;
-
-    GtkWidget     *price_in_e, *price_out_e, *budget_e, *currency_e;
-    GtkWidget     *usage_summary;
-    GtkTextBuffer *usage_buf;
-    GPtrArray     *usage;        /* Usage* */
-    char          *period_start;
-
-    char *cfg_host, *cfg_key, *cfg_price_in, *cfg_price_out;
-    char *cfg_budget, *cfg_currency, *cfg_serve_cmd, *cfg_signin_cmd;
-    gboolean cfg_remember_key;
-} App;
-
-static char *auth_header(App *app);
-static void  usage_record(App *app, const char *model, gint64 in_tok,
-                          gint64 out_tok);
-static void  render_usage(App *app);
-static void  save_state(App *app);
-static void  load_state(App *app);
-static void  start_inventory_load(App *app);
-static void  start_version_probe(App *app);
-static void  on_shutdown(GApplication *gapp, gpointer data);
-static GtkWidget *build_left_pane(App *app, GtkWidget *request_page);
-
-/* ------------------------------------------------------------------ */
-/* small helpers                                                      */
-/* ------------------------------------------------------------------ */
+static void margins(GtkWidget *w, int m)
+{
+    gtk_widget_set_margin_start(w, m);
+    gtk_widget_set_margin_end(w, m);
+    gtk_widget_set_margin_top(w, m);
+    gtk_widget_set_margin_bottom(w, m);
+}
 
 static char *buffer_text(GtkTextBuffer *b)
 {
     GtkTextIter s, e;
+
     gtk_text_buffer_get_bounds(b, &s, &e);
     return gtk_text_buffer_get_text(b, &s, &e, FALSE);
 }
 
-static void chat_append(App *app, const char *s)
+/* ------------------------------------------------------------------ */
+/*  transcript: bubbles in a vertical box                             */
+/* ------------------------------------------------------------------ */
+
+static const char CHAT_CSS[] =
+    ".chat { padding: 10px; }\n"
+    ".bubble-user { background-color: alpha(#3584e4, 0.18);"
+    "  border-radius: 14px 14px 4px 14px; padding: 8px 12px; }\n"
+    ".bubble-asst { background-color: alpha(#808080, 0.12);"
+    "  border-radius: 14px 14px 14px 4px; padding: 8px 12px; }\n"
+    ".bubble-asst textview, .bubble-asst textview text"
+    "  { background-color: transparent; }\n"
+    ".think-toggle { padding: 1px 8px; min-height: 0; font-size: smaller; }\n"
+    ".think-view { font-style: italic; opacity: 0.7; }\n"
+    ".caption { font-size: smaller; font-weight: bold; }\n"
+    ".note { font-size: smaller; }\n"
+    ".note-error { color: #c01c28; }\n";
+
+static void load_css(void)
+{
+    GtkCssProvider *p = gtk_css_provider_new();
+
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(p, CHAT_CSS);
+#else
+    gtk_css_provider_load_from_data(p, CHAT_CSS, -1);
+#endif
+    gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+        GTK_STYLE_PROVIDER(p), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(p);
+}
+
+/* follow the end unless the user has scrolled up */
+static void on_adj_value(GtkAdjustment *a, gpointer data)
+{
+    App *app = data;
+
+    app->follow = gtk_adjustment_get_value(a) + gtk_adjustment_get_page_size(a)
+                  >= gtk_adjustment_get_upper(a) - 24.0;
+}
+
+static void on_adj_bounds(GObject *o, GParamSpec *ps, gpointer data)
+{
+    App *app = data;
+    GtkAdjustment *a = GTK_ADJUSTMENT(o);
+
+    (void)ps;
+    if (app->follow)
+        gtk_adjustment_set_value(a, gtk_adjustment_get_upper(a) -
+                                    gtk_adjustment_get_page_size(a));
+}
+
+static void chat_follow(App *app)
+{
+    app->follow = TRUE;
+    gtk_adjustment_set_value(app->chat_adj,
+                             gtk_adjustment_get_upper(app->chat_adj) -
+                             gtk_adjustment_get_page_size(app->chat_adj));
+}
+
+static void chat_add(App *app, GtkWidget *w)
+{
+    gtk_box_append(GTK_BOX(app->chat_box), w);
+    chat_follow(app);
+}
+
+static void chat_clear(App *app)
+{
+    GtkWidget *c;
+
+    while ((c = gtk_widget_get_first_child(app->chat_box)) != NULL)
+        gtk_box_remove(GTK_BOX(app->chat_box), c);
+    app->cur_box = NULL;
+    app->cur_think_buf = app->cur_text_buf = NULL;
+}
+
+static GtkWidget *wrap_label(const char *text)
+{
+    GtkWidget *l = gtk_label_new(text);
+
+    gtk_label_set_wrap(GTK_LABEL(l), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(l), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+    gtk_label_set_selectable(GTK_LABEL(l), TRUE);
+    return l;
+}
+
+/* status / error lines inside the transcript */
+static void chat_note(App *app, const char *text, gboolean error)
+{
+    GtkWidget *l = wrap_label(text);
+
+    gtk_widget_add_css_class(l, "note");
+    gtk_widget_add_css_class(l, error ? "note-error" : "dim-label");
+    gtk_widget_set_halign(l, GTK_ALIGN_START);
+    chat_add(app, l);
+}
+
+/* your turn: right-aligned bubble hugging its text */
+static void chat_add_user(App *app, const char *text, GPtrArray *att)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    guint i;
+
+    gtk_widget_add_css_class(box, "bubble-user");
+    gtk_widget_set_halign(box, GTK_ALIGN_END);
+    gtk_widget_set_margin_start(box, 64);
+    if (text && *text) {
+        GtkWidget *l = wrap_label(text);
+
+        gtk_label_set_max_width_chars(GTK_LABEL(l), 72);
+        gtk_box_append(GTK_BOX(box), l);
+    }
+    if (att && att->len) {
+        GString *s = g_string_new(NULL);
+        GtkWidget *l;
+
+        for (i = 0; i < att->len; i++)
+            g_string_append_printf(s, "%s%s", i ? " · " : "📎 ",
+                ((Attachment *)g_ptr_array_index(att, i))->name);
+        l = wrap_label(s->str);
+        gtk_label_set_max_width_chars(GTK_LABEL(l), 72);
+        gtk_widget_add_css_class(l, "dim-label");
+        gtk_box_append(GTK_BOX(box), l);
+        g_string_free(s, TRUE);
+    }
+    chat_add(app, box);
+}
+
+static GtkWidget *bubble_text_view(GtkTextBuffer **buf, const char *css)
+{
+    GtkWidget *tv = gtk_text_view_new();
+
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(tv), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
+    if (css)
+        gtk_widget_add_css_class(tv, css);
+    *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
+    return tv;
+}
+
+/* reply: left-aligned bubble, full width minus a right gutter */
+static void asst_begin(App *app)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+    GtkWidget *cap = gtk_label_new(model && *model ? model : "assistant");
+
+    gtk_widget_add_css_class(box, "bubble-asst");
+    gtk_widget_set_halign(box, GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(box, TRUE);
+    gtk_widget_set_margin_end(box, 64);
+    gtk_widget_add_css_class(cap, "caption");
+    gtk_widget_add_css_class(cap, "dim-label");
+    gtk_widget_set_halign(cap, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(box), cap);
+    app->cur_box = box;
+    chat_add(app, box);
+}
+
+static void on_think_toggle(GtkButton *b, gpointer data)
+{
+    GtkRevealer *rev = data;
+    gboolean show = !gtk_revealer_get_reveal_child(rev);
+
+    gtk_revealer_set_reveal_child(rev, show);
+    gtk_button_set_label(b, show ? "✕  Thinking" : "＋  Thinking");
+}
+
+/* collapsed thinking section, placed right under the caption */
+static void asst_think(App *app)
+{
+    GtkWidget *btn = gtk_button_new_with_label("＋  Thinking");
+    GtkWidget *rev = gtk_revealer_new();
+    GtkWidget *tv = bubble_text_view(&app->cur_think_buf, "think-view");
+    GtkWidget *cap = gtk_widget_get_first_child(app->cur_box);
+
+    gtk_widget_add_css_class(btn, "flat");
+    gtk_widget_add_css_class(btn, "think-toggle");
+    gtk_widget_set_halign(btn, GTK_ALIGN_START);
+    gtk_revealer_set_transition_type(GTK_REVEALER(rev),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(rev), FALSE);
+    gtk_revealer_set_child(GTK_REVEALER(rev), tv);
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_think_toggle), rev);
+    gtk_box_insert_child_after(GTK_BOX(app->cur_box), btn, cap);
+    gtk_box_insert_child_after(GTK_BOX(app->cur_box), rev, btn);
+}
+
+static void asst_text(App *app)
+{
+    gtk_box_append(GTK_BOX(app->cur_box),
+                   bubble_text_view(&app->cur_text_buf, NULL));
+}
+
+/* append, dropping the newlines models like to open with */
+static void buf_append(GtkTextBuffer *b, const char *s)
 {
     GtkTextIter end;
 
-    if (!s || !*s)
+    if (gtk_text_buffer_get_char_count(b) == 0)
+        while (*s == '\n' || *s == '\r')
+            s++;
+    if (!*s)
         return;
-    gtk_text_buffer_get_end_iter(app->chat_buf, &end);
-    gtk_text_buffer_insert(app->chat_buf, &end, s, -1);
-    gtk_text_buffer_get_end_iter(app->chat_buf, &end);
-    gtk_text_buffer_move_mark(app->chat_buf, app->end_mark, &end);
-    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(app->chat_view),
-                                 app->end_mark, 0.0, TRUE, 0.0, 1.0);
+    gtk_text_buffer_get_end_iter(b, &end);
+    gtk_text_buffer_insert(b, &end, s, -1);
+}
+
+/* ...and the trailing whitespace they close with */
+static void buf_rstrip(GtkTextBuffer *b)
+{
+    GtkTextIter s, e;
+
+    gtk_text_buffer_get_end_iter(b, &e);
+    s = e;
+    while (gtk_text_iter_backward_char(&s))
+        if (!g_unichar_isspace(gtk_text_iter_get_char(&s))) {
+            gtk_text_iter_forward_char(&s);
+            break;
+        }
+    if (!gtk_text_iter_equal(&s, &e))
+        gtk_text_buffer_delete(b, &s, &e);
 }
 
 static void set_status(App *app, const char *fmt, ...)
@@ -201,297 +1690,569 @@ static void show_error(App *app, const char *msg)
     g_object_unref(d);
 }
 
+static double entry_double(GtkWidget *e)
+{
+    const char *t = gtk_editable_get_text(GTK_EDITABLE(e));
+
+    return (t && *t) ? g_ascii_strtod(t, NULL) : 0.0;
+}
+
+static gint64 entry_ll(GtkWidget *e, gint64 dflt)
+{
+    const char *t = gtk_editable_get_text(GTK_EDITABLE(e));
+
+    return (t && *t) ? g_ascii_strtoll(t, NULL, 10) : dflt;
+}
+
+static void show_text_window(App *app, const char *title, const char *text)
+{
+    GtkWidget *win = gtk_window_new();
+    GtkWidget *sw = gtk_scrolled_window_new();
+    GtkWidget *tv = gtk_text_view_new();
+    GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
+
+    gtk_text_buffer_set_text(buf, text, -1);
+    gtk_text_view_set_buffer(GTK_TEXT_VIEW(tv), buf);
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(tv), TRUE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
+    g_object_unref(buf);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), tv);
+    gtk_window_set_child(GTK_WINDOW(win), sw);
+    gtk_window_set_title(GTK_WINDOW(win), title);
+    gtk_window_set_default_size(GTK_WINDOW(win), 780, 560);
+    gtk_window_set_transient_for(GTK_WINDOW(win), app->win);
+    gtk_window_present(GTK_WINDOW(win));
+    (void)app;
+}
+
+/* ================================================================== */
+/*  config persistence                                                */
+/* ================================================================== */
+
+static double key_dbl(GKeyFile *kf, const char *g, const char *k, double d)
+{
+    return g_key_file_has_key(kf, g, k, NULL)
+           ? g_key_file_get_double(kf, g, k, NULL) : d;
+}
+
+static gint64 key_i64(GKeyFile *kf, const char *g, const char *k, gint64 d)
+{
+    return g_key_file_has_key(kf, g, k, NULL)
+           ? g_key_file_get_int64(kf, g, k, NULL) : d;
+}
+
+static gboolean key_bool(GKeyFile *kf, const char *g, const char *k, gboolean d)
+{
+    return g_key_file_has_key(kf, g, k, NULL)
+           ? g_key_file_get_boolean(kf, g, k, NULL) : d;
+}
+
+static void config_save(App *app)
+{
+    GKeyFile *kf = g_key_file_new();
+    char *dir = g_build_filename(g_get_user_config_dir(), "ollama-gui", NULL);
+    char *path = g_build_filename(dir, "config.ini", NULL);
+    gboolean remember;
+    int i;
+
+    remember = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->remember_cb));
+    g_key_file_set_integer(kf, "ui", "provider", (int)app->prov_id);
+    g_key_file_set_string(kf, "ui", "model",
+                          gtk_editable_get_text(GTK_EDITABLE(app->model_entry)));
+    g_key_file_set_double(kf, "gen", "temperature", entry_double(app->temp_e));
+    g_key_file_set_double(kf, "gen", "top_p", entry_double(app->topp_e));
+    g_key_file_set_int64(kf, "gen", "max_tokens", entry_ll(app->maxtok_e, 0));
+    g_key_file_set_int64(kf, "gen", "seed", entry_ll(app->seed_e, -1));
+    g_key_file_set_boolean(kf, "ui", "stream",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb)));
+    g_key_file_set_boolean(kf, "gen", "use_temperature",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->temp_cb)));
+    g_key_file_set_boolean(kf, "gen", "use_top_p",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->topp_cb)));
+    g_key_file_set_boolean(kf, "gen", "use_max_tokens",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->maxtok_cb)));
+    g_key_file_set_boolean(kf, "gen", "use_seed",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->seed_cb)));
+    g_key_file_set_integer(kf, "gen", "thinking",
+        (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(app->think_dd)));
+    g_key_file_set_integer(kf, "gen", "effort",
+        (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(app->effort_dd)));
+    g_key_file_set_boolean(kf, "gen", "auto_adapt",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->adapt_cb)));
+    {
+        GHashTableIter it;
+        gpointer k, v;
+
+        g_hash_table_iter_init(&it, app->quirks);
+        while (g_hash_table_iter_next(&it, &k, &v))
+            if (!strpbrk(k, "=[]\n"))         /* not a valid key name */
+                g_key_file_set_integer(kf, "quirks", k,
+                                       (int)GPOINTER_TO_UINT(v));
+    }
+    g_key_file_set_boolean(kf, "auth", "remember", remember);
+    for (i = 0; i < PROV_COUNT; i++) {
+        if (app->hosts[i] && *app->hosts[i])
+            g_key_file_set_string(kf, "hosts", prov_get((ProvId)i)->id_name,
+                                  app->hosts[i]);
+        if (remember && app->keys[i] && *app->keys[i])
+            g_key_file_set_string(kf, "keys", prov_get((ProvId)i)->id_name,
+                                  app->keys[i]);
+    }
+    if (!remember)
+        g_key_file_remove_group(kf, "keys", NULL);   /* purge stale keys */
+    g_mkdir_with_parents(dir, 0700);
+    if (g_key_file_save_to_file(kf, path, NULL))
+        g_chmod(path, 0600);                         /* keep it private */
+    g_key_file_free(kf);
+    g_free(path);
+    g_free(dir);
+}
+
+static gboolean save_timeout(gpointer data)
+{
+    App *app = data;
+
+    app->save_id = 0;
+    if (!app->closing)
+        config_save(app);
+    return G_SOURCE_REMOVE;
+}
+
+/* one disk write per burst of keystrokes instead of one per keystroke */
+static void config_save_later(App *app)
+{
+    if (app->closing)
+        return;
+    if (app->save_id)
+        g_source_remove(app->save_id);
+    app->save_id = g_timeout_add(500, save_timeout, app);
+}
+
+static void config_load(App *app)
+{
+    GKeyFile *kf = g_key_file_new();
+    char *path = g_build_filename(g_get_user_config_dir(),
+                                  "ollama-gui", "config.ini", NULL);
+    int i;
+
+    app->cfg_provider = 0;
+    app->cfg_temp = 0.8;
+    app->cfg_topp = 0.9;
+    app->cfg_maxtok = 4096;
+    app->cfg_seed = 42;
+    app->cfg_stream = TRUE;
+    app->cfg_think = THINK_DEFAULT;
+    app->cfg_effort = 0;
+    app->cfg_remember = FALSE;
+    app->cfg_adapt = TRUE;
+    app->cfg_use_temp = TRUE;
+    app->cfg_use_topp = FALSE;
+    app->cfg_use_maxtok = FALSE;
+    app->cfg_use_seed = FALSE;
+
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        app->cfg_provider = g_key_file_get_integer(kf, "ui", "provider", NULL);
+        if (app->cfg_provider < 0 || app->cfg_provider >= PROV_COUNT)
+            app->cfg_provider = 0;
+        app->cfg_model = g_key_file_get_string(kf, "ui", "model", NULL);
+        app->cfg_temp  = key_dbl(kf, "gen", "temperature", 0.8);
+        app->cfg_topp  = key_dbl(kf, "gen", "top_p", 0.9);
+        app->cfg_maxtok = key_i64(kf, "gen", "max_tokens", 4096);
+        app->cfg_seed  = key_i64(kf, "gen", "seed", 42);
+        app->cfg_stream = key_bool(kf, "ui", "stream", TRUE);
+        /* older configs: ui/think boolean, and every parameter always sent */
+        app->cfg_think = g_key_file_has_key(kf, "gen", "thinking", NULL)
+            ? (int)key_i64(kf, "gen", "thinking", THINK_DEFAULT)
+            : (key_bool(kf, "ui", "think", FALSE) ? THINK_ON : THINK_DEFAULT);
+        if (app->cfg_think < THINK_DEFAULT || app->cfg_think > THINK_OFF)
+            app->cfg_think = THINK_DEFAULT;
+        app->cfg_effort = (int)key_i64(kf, "gen", "effort", 0);
+        if (app->cfg_effort < 0 || app->cfg_effort >= (int)G_N_ELEMENTS(EFFORTS))
+            app->cfg_effort = 0;
+        app->cfg_adapt = key_bool(kf, "gen", "auto_adapt", TRUE);
+        app->cfg_use_temp = key_bool(kf, "gen", "use_temperature", TRUE);
+        app->cfg_use_topp = key_bool(kf, "gen", "use_top_p", FALSE);
+        app->cfg_use_maxtok = key_bool(kf, "gen", "use_max_tokens",
+                                       app->cfg_maxtok > 0);
+        app->cfg_use_seed = key_bool(kf, "gen", "use_seed", app->cfg_seed >= 0);
+        {
+            gsize n = 0, k;
+            char **keys = g_key_file_get_keys(kf, "quirks", &n, NULL);
+
+            for (k = 0; keys && k < n; k++) {
+                guint v = (guint)g_key_file_get_integer(kf, "quirks",
+                                                        keys[k], NULL) & Q_MASK;
+                if (v)
+                    g_hash_table_replace(app->quirks, g_strdup(keys[k]),
+                                         GUINT_TO_POINTER(v));
+            }
+            g_strfreev(keys);
+        }
+        app->cfg_remember = key_bool(kf, "auth", "remember", FALSE);
+        for (i = 0; i < PROV_COUNT; i++) {
+            const char *nm = prov_get((ProvId)i)->id_name;
+
+            app->keys[i]  = g_key_file_get_string(kf, "keys", nm, NULL);
+            app->hosts[i] = g_key_file_get_string(kf, "hosts", nm, NULL);
+        }
+    }
+    g_key_file_free(kf);
+    g_free(path);
+}
+
+/* ------------------------------------------------------------------ */
+/*  per-model parameter quirks                                        */
+/* ------------------------------------------------------------------ */
+
+static char *quirk_key(ProvId id, const char *model)
+{
+    return g_strdup_printf("%s/%s", prov_get(id)->id_name, model ? model : "");
+}
+
+static guint model_quirks(App *app, ProvId id, const char *model)
+{
+    char *k = quirk_key(id, model);
+    guint q = builtin_quirks(id, model) |
+              GPOINTER_TO_UINT(g_hash_table_lookup(app->quirks, k));
+
+    g_free(k);
+    return q;
+}
+
+static char *quirk_names(guint q)
+{
+    static const struct { guint bit; const char *name; } N[] = {
+        { P_TEMP, "temperature" },   { P_TOPP, "top-p" },
+        { P_MAXTOK, "max tokens" },  { P_SEED, "seed" },
+        { P_THINK, "thinking" },     { P_EFFORT, "effort" },
+        { P_NO_OFF, "thinking off" },
+        { P_LEGACY, "adaptive thinking (budget used)" },
+        { P_MCT, "max_tokens (max_completion_tokens used)" },
+        { P_NODISPLAY, "thinking display" },
+    };
+    GString *s = g_string_new(NULL);
+    guint i;
+
+    for (i = 0; i < G_N_ELEMENTS(N); i++)
+        if (q & N[i].bit)
+            g_string_append_printf(s, "%s%s", s->len ? " · " : "", N[i].name);
+    return g_string_free(s, FALSE);
+}
+
+static void quirks_refresh(App *app)
+{
+    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+    guint q = model_quirks(app, app->prov_id, model);
+    char *k = quirk_key(app->prov_id, model);
+
+    if (q) {
+        char *names = quirk_names(q);
+        char *txt = g_strdup_printf("Not sent / adapted for this model: %s",
+                                    names);
+
+        gtk_label_set_text(GTK_LABEL(app->quirk_label), txt);
+        g_free(txt);
+        g_free(names);
+    }
+    gtk_widget_set_visible(app->quirk_label, q != 0);
+    gtk_widget_set_visible(app->quirk_reset,
+                           g_hash_table_contains(app->quirks, k));
+    g_free(k);
+}
+
+static void quirks_learn(App *app, const char *key, guint add)
+{
+    guint old = GPOINTER_TO_UINT(g_hash_table_lookup(app->quirks, key));
+
+    g_hash_table_replace(app->quirks, g_strdup(key),
+                         GUINT_TO_POINTER((old | add) & Q_MASK));
+    quirks_refresh(app);
+    config_save(app);
+}
+
+static void gen_params(App *app, const char *model, GenParams *gp)
+{
+    guint t = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->think_dd));
+    guint e = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->effort_dd));
+
+    memset(gp, 0, sizeof *gp);
+    gp->use_temp   = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->temp_cb));
+    gp->use_topp   = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->topp_cb));
+    gp->use_maxtok = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->maxtok_cb));
+    gp->use_seed   = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->seed_cb));
+    gp->temp       = entry_double(app->temp_e);
+    gp->top_p      = entry_double(app->topp_e);
+    gp->max_tokens = (int)entry_ll(app->maxtok_e, 0);
+    gp->seed       = entry_ll(app->seed_e, -1);
+    gp->think      = (t <= THINK_OFF) ? (int)t : THINK_DEFAULT;
+    gp->effort     = (e < G_N_ELEMENTS(EFFORTS)) ? EFFORTS[e] : NULL;
+    gp->quirks     = model_quirks(app, app->prov_id, model);
+}
+
+/* gtk_editable_set_text() deletes, then inserts, emitting "changed" for
+ * each step. The delete step used to run on_key_changed/on_host_changed,
+ * which freed app->keys[id] / app->hosts[id] -- the very string still
+ * being inserted (use-after-free) -- and could save a blank key. Copy
+ * first and keep the handlers quiet while the entries are refilled. */
+static void provider_apply(App *app)
+{
+    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->prov_dd));
+    ProvId id = (i == GTK_INVALID_LIST_POSITION || (int)i >= PROV_COUNT)
+                ? PROV_OLLAMA : (ProvId)i;
+    char *key = g_strdup(app->keys[id] ? app->keys[id] : "");
+    char *host = g_strdup((app->hosts[id] && *app->hosts[id])
+                          ? app->hosts[id] : prov_get(id)->default_host);
+
+    if (id != app->prov_id) {          /* listed models belong to the old one */
+        guint cnt = g_list_model_get_n_items(G_LIST_MODEL(app->model_list));
+
+        g_ptr_array_set_size(app->models, 0);
+        if (cnt)
+            gtk_string_list_splice(app->model_list, 0, cnt, NULL);
+    }
+    app->prov_id = id;
+    app->quiet = TRUE;
+    gtk_editable_set_text(GTK_EDITABLE(app->key_e), key);
+    gtk_editable_set_text(GTK_EDITABLE(app->host_e), host);
+    app->quiet = FALSE;
+    gtk_widget_set_sensitive(app->key_e, id != PROV_OLLAMA);
+    set_status(app, "Provider: %s", prov_get(id)->label);
+    quirks_refresh(app);
+    g_free(key);
+    g_free(host);
+}
+
+static void apply_config(App *app)
+{
+    char buf[32];
+
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(app->prov_dd),
+                               (guint)app->cfg_provider);
+    provider_apply(app);                       /* also for the no-change case */
+    if (app->cfg_model && *app->cfg_model)
+        gtk_editable_set_text(GTK_EDITABLE(app->model_entry), app->cfg_model);
+    g_free(app->cfg_model);
+    app->cfg_model = NULL;
+    g_snprintf(buf, sizeof buf, "%.2f", app->cfg_temp);
+    gtk_editable_set_text(GTK_EDITABLE(app->temp_e), buf);
+    g_snprintf(buf, sizeof buf, "%.2f", app->cfg_topp);
+    gtk_editable_set_text(GTK_EDITABLE(app->topp_e), buf);
+    g_snprintf(buf, sizeof buf, "%lld", (long long)app->cfg_maxtok);
+    gtk_editable_set_text(GTK_EDITABLE(app->maxtok_e), buf);
+    g_snprintf(buf, sizeof buf, "%lld", (long long)app->cfg_seed);
+    gtk_editable_set_text(GTK_EDITABLE(app->seed_e), buf);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->stream_cb), app->cfg_stream);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->temp_cb), app->cfg_use_temp);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->topp_cb), app->cfg_use_topp);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->maxtok_cb),
+                                app->cfg_use_maxtok);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->seed_cb), app->cfg_use_seed);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(app->think_dd), (guint)app->cfg_think);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(app->effort_dd),
+                               (guint)app->cfg_effort);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->adapt_cb), app->cfg_adapt);
+    quirks_refresh(app);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->remember_cb),
+                                app->cfg_remember);
+}
+
+/* keep history[0] in sync with the system-prompt buffer */
+static void sync_system(App *app)
+{
+    char *sys = buffer_text(app->sys_buf);
+    Msg *first = app->history->len ? g_ptr_array_index(app->history, 0) : NULL;
+    gboolean had = first && !g_strcmp0(first->role, "system");
+
+    if (had) {
+        g_free(first->text);
+        first->text = sys;                     /* takes ownership */
+        sys = NULL;
+        if (!first->text || !*first->text)
+            g_ptr_array_remove_index(app->history, 0);
+    } else if (sys && *sys) {
+        g_ptr_array_insert(app->history, 0, msg_new("system", sys));
+    }
+    g_free(sys);
+}
+
+/* ================================================================== */
+/*  attachments                                                       */
+/* ================================================================== */
+
+#define ATT_IMG_MAX (20u * 1024 * 1024)   /* raw bytes per image     */
+#define ATT_TXT_MAX (1024u * 1024)        /* bytes per text file     */
+
 static void attachment_free(gpointer p)
 {
     Attachment *a = p;
 
-    g_free(a->path);
+    g_free(a->name);
+    g_free(a->data);
     g_free(a);
 }
 
-static char *base_url(App *app)
+/* formats all four providers take as-is; others are re-encoded */
+static gboolean mime_passthrough(const char *mime)
 {
-    const char *h = gtk_editable_get_text(GTK_EDITABLE(app->host_entry));
-    char *s = g_strstrip(g_strdup(h ? h : ""));
-    gsize n = strlen(s);
-
-    while (n > 0 && s[n - 1] == '/')
-        s[--n] = '\0';
-    return s;
+    return !g_strcmp0(mime, "image/png")  || !g_strcmp0(mime, "image/jpeg") ||
+           !g_strcmp0(mime, "image/gif")  || !g_strcmp0(mime, "image/webp");
 }
 
-static const char *selected_model(App *app)
+static Attachment *attachment_load(GFile *f, char **why)
 {
-    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->model_dd));
+    char *name = g_file_get_basename(f), *data = NULL, *ctype, *mime;
+    gsize len = 0;
+    GError *err = NULL;
+    Attachment *a = NULL;
 
-    if (i == GTK_INVALID_LIST_POSITION || i >= app->models->len)
-        return "";
-    return g_ptr_array_index(app->models, i);
-}
-
-static int selected_endpoint(App *app)
-{
-    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->endpoint_dd));
-
-    return (i == GTK_INVALID_LIST_POSITION) ? 0 : (int)i;
-}
-
-static const char *obj_str(JsonObject *o, const char *key)
-{
-    JsonNode *n;
-
-    if (!o || !json_object_has_member(o, key))
+    if (!g_file_load_contents(f, NULL, &data, &len, NULL, &err)) {
+        *why = g_strdup_printf("%s: %s", name, err->message);
+        g_error_free(err);
+        g_free(name);
         return NULL;
-    n = json_object_get_member(o, key);
-    if (!JSON_NODE_HOLDS_VALUE(n))
-        return NULL;
-    return json_node_get_string(n);
-}
+    }
+    ctype = g_content_type_guess(name, (const guchar *)data, len, NULL);
+    mime = g_content_type_get_mime_type(ctype);
 
-static gint64 obj_int(JsonObject *o, const char *key, gint64 dflt)
-{
-    JsonNode *n;
+    if (mime && g_str_has_prefix(mime, "image/") &&
+        strcmp(mime, "image/svg+xml") != 0) {
+        if (len > ATT_IMG_MAX) {
+            *why = g_strdup_printf("%s: image larger than %u MiB",
+                                   name, ATT_IMG_MAX >> 20);
+        } else if (mime_passthrough(mime)) {
+            a = g_new0(Attachment, 1);
+            a->data = g_base64_encode((const guchar *)data, len);
+        } else {                                 /* BMP, TIFF, ... -> PNG */
+            GBytes *in = g_bytes_new(data, len);
+            GdkTexture *t = gdk_texture_new_from_bytes(in, &err);
 
-    if (!o || !json_object_has_member(o, key))
-        return dflt;
-    n = json_object_get_member(o, key);
-    if (!JSON_NODE_HOLDS_VALUE(n))
-        return dflt;
-    return json_node_get_int(n);
-}
+            g_bytes_unref(in);
+            if (t) {
+                GBytes *png = gdk_texture_save_to_png_bytes(t);
+                gsize n = 0;
+                gconstpointer d = g_bytes_get_data(png, &n);
 
-static gboolean obj_true(JsonObject *o, const char *key)
-{
-    JsonNode *n;
-
-    if (!o || !json_object_has_member(o, key))
-        return FALSE;
-    n = json_object_get_member(o, key);
-    if (!JSON_NODE_HOLDS_VALUE(n))
-        return FALSE;
-    return json_node_get_boolean(n);
-}
-
-static char *node_to_string(JsonNode *n, gboolean pretty)
-{
-    JsonGenerator *g = json_generator_new();
-    char *s;
-
-    json_generator_set_root(g, n);
-    json_generator_set_pretty(g, pretty);
-    if (pretty)
-        json_generator_set_indent(g, 2);
-    s = json_generator_to_data(g, NULL);
-    g_object_unref(g);
-    return s;
-}
-
-static char *timestamp(void)
-{
-    GDateTime *t = g_date_time_new_now_local();
-    char *s = g_date_time_format(t, "%H:%M:%S");
-
-    g_date_time_unref(t);
-    return s;
-}
-
-/* ------------------------------------------------------------------ */
-/* attachments                                                        */
-/* ------------------------------------------------------------------ */
-
-static LoadMode resolve_mode(const Attachment *a)
-{
-    static const char *const img[] = {
-        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", NULL
-    };
-    char *lower;
-    LoadMode m = MODE_TEXT;
-    int i;
-
-    if (a->mode != MODE_AUTO)
-        return a->mode;
-    lower = g_ascii_strdown(a->path, -1);
-    for (i = 0; img[i]; i++) {
-        if (g_str_has_suffix(lower, img[i])) {
-            m = MODE_IMAGE;
-            break;
+                a = g_new0(Attachment, 1);
+                a->data = g_base64_encode(d, n);
+                g_bytes_unref(png);
+                g_object_unref(t);
+            } else {
+                *why = g_strdup_printf("%s: unsupported image (%s)",
+                                       name, err->message);
+                g_error_free(err);
+            }
         }
+        if (a)
+            a->image = TRUE;
+    } else if (len > ATT_TXT_MAX) {
+        *why = g_strdup_printf("%s: text file larger than %u KiB",
+                               name, ATT_TXT_MAX >> 10);
+    } else if (memchr(data, '\0', len) ||
+               !g_utf8_validate(data, (gssize)len, NULL)) {
+        *why = g_strdup_printf("%s: neither an image nor UTF-8 text", name);
+    } else {
+        a = g_new0(Attachment, 1);
+        a->data = data;                          /* takes ownership */
+        data = NULL;
     }
-    if (m == MODE_TEXT && g_str_has_suffix(lower, ".json"))
-        m = MODE_JSON;
-    g_free(lower);
-    return m;
+    if (a) {
+        a->name = name;
+        a->bytes = len;
+        name = NULL;
+    }
+    g_free(name);
+    g_free(data);
+    g_free(ctype);
+    g_free(mime);
+    return a;
 }
 
-static const char *mode_name(LoadMode m)
+static void att_refresh(App *app)
 {
-    switch (m) {
-    case MODE_IMAGE: return "image";
-    case MODE_JSON:  return "json";
-    case MODE_B64:   return "base64";
-    default:         return "text";
-    }
-}
-
-static void refresh_attachment_list(App *app)
-{
-    GString *s;
+    GString *s = g_string_new(NULL);
     guint i;
 
-    if (app->attachments->len == 0) {
-        gtk_text_buffer_set_text(app->attach_buf, "(no files attached)", -1);
-        return;
-    }
-    s = g_string_new(NULL);
-    for (i = 0; i < app->attachments->len; i++) {
-        Attachment *a = g_ptr_array_index(app->attachments, i);
-        char *base = g_path_get_basename(a->path);
+    for (i = 0; i < app->att->len; i++) {
+        Attachment *a = g_ptr_array_index(app->att, i);
+        char *sz = g_format_size(a->bytes);
 
-        g_string_append_printf(s, "%u. %s  [%s]\n", i + 1, base,
-                               mode_name(resolve_mode(a)));
-        g_free(base);
+        g_string_append_printf(s, "%s%s (%s%s)", i ? " · " : "📎 ",
+                               a->name, a->image ? "image, " : "", sz);
+        g_free(sz);
     }
-    if (s->len)
-        g_string_truncate(s, s->len - 1);
-    gtk_text_buffer_set_text(app->attach_buf, s->str, -1);
+    gtk_label_set_text(GTK_LABEL(app->att_label),
+                       s->len ? s->str : "no attachments");
+    gtk_widget_set_tooltip_text(app->att_label, s->len ? s->str : NULL);
+    gtk_widget_set_sensitive(app->att_clear_btn, app->att->len > 0);
     g_string_free(s, TRUE);
 }
 
-static gsize char_limit(App *app)
+/* the user turn as the model sees it: typed text, inlined text files,
+ * images as separate base64 parts */
+static Msg *compose_user_msg(GPtrArray *att, const char *input)
 {
-    const char *t = gtk_editable_get_text(GTK_EDITABLE(app->limit_e));
-    gint64 v = t ? g_ascii_strtoll(t, NULL, 10) : 0;
-
-    return (v > 0) ? (gsize)v : 20000;
-}
-
-/*
- * Fold every attachment into the message: text-like files become fenced
- * blocks inside "content", images become base64 strings for "images".
- */
-static gboolean build_user_content(App *app, const char *text,
-                                   GString *content, GPtrArray *images,
-                                   GError **err)
-{
-    gsize limit = char_limit(app);
+    GString *t = g_string_new(input);
+    Msg *m;
     guint i;
 
-    if (text && *text)
-        g_string_append(content, text);
+    for (i = 0; i < att->len; i++) {
+        Attachment *a = g_ptr_array_index(att, i);
+        gsize n;
 
-    for (i = 0; i < app->attachments->len; i++) {
-        Attachment *a = g_ptr_array_index(app->attachments, i);
-        LoadMode m = resolve_mode(a);
-        char *base = g_path_get_basename(a->path);
-        char *data = NULL;
-        gsize len = 0;
-
-        if (!g_file_get_contents(a->path, &data, &len, err)) {
-            g_free(base);
-            return FALSE;
-        }
-        if (content->len)
-            g_string_append(content, "\n\n");
-
-        if (m == MODE_IMAGE) {
-            g_ptr_array_add(images, g_base64_encode((const guchar *)data, len));
-            g_string_append_printf(content, "[attached image: %s]", base);
-        } else if (m == MODE_B64) {
-            char *b64 = g_base64_encode((const guchar *)data, len);
-
-            g_string_append_printf(content,
-                                   "### %s (base64, %" G_GSIZE_FORMAT " bytes)\n%s",
-                                   base, len, b64);
-            g_free(b64);
-        } else {
-            const char *invalid = NULL;
-            const char *dot;
-            char *fence;
-            gsize keep = len;
-            gboolean truncated = FALSE;
-
-            if (m == MODE_JSON) {
-                JsonParser *p = json_parser_new();
-
-                if (!json_parser_load_from_data(p, data, (gssize)len, err)) {
-                    g_object_unref(p);
-                    g_free(data);
-                    g_free(base);
-                    return FALSE;
-                }
-                g_object_unref(p);
-            }
-            if (!g_utf8_validate(data, (gssize)len, &invalid))
-                keep = (gsize)(invalid - data);
-            if (g_utf8_strlen(data, (gssize)keep) > (glong)limit) {
-                const char *cut = g_utf8_offset_to_pointer(data, (glong)limit);
-
-                keep = (gsize)(cut - data);
-                truncated = TRUE;
-            }
-            dot = strrchr(base, '.');
-            fence = (m == MODE_JSON) ? g_strdup("json")
-                                     : (dot ? g_ascii_strdown(dot + 1, -1)
-                                            : g_strdup(""));
-            g_string_append_printf(content, "### %s\n```%s\n", base, fence);
-            g_string_append_len(content, data, (gssize)keep);
-            g_string_append(content, "\n```");
-            if (truncated)
-                g_string_append_printf(content,
-                                       "\n[truncated at %" G_GSIZE_FORMAT " characters]",
-                                       limit);
-            g_free(fence);
-        }
-        g_free(data);
-        g_free(base);
+        if (a->image)
+            continue;
+        n = strlen(a->data);
+        if (t->len)
+            g_string_append(t, "\n\n");
+        g_string_append_printf(t, "<file name=\"%s\">\n%s%s</file>",
+                               a->name, a->data,
+                               (n && a->data[n - 1] == '\n') ? "" : "\n");
     }
-    return TRUE;
+    m = msg_new("user", t->str);
+    g_string_free(t, TRUE);
+    for (i = 0; i < att->len; i++) {
+        Attachment *a = g_ptr_array_index(att, i);
+
+        if (!a->image)
+            continue;
+        if (!m->images)
+            m->images = g_ptr_array_new_with_free_func(g_free);
+        g_ptr_array_add(m->images, g_strdup(a->data));
+    }
+    return m;
 }
 
-/*
- * The settings/chat split is a GtkPaned, so the divider can always be
- * dragged by hand. On top of that, while the "Split follows mouse
- * pointer" toggle is active, the pointer's x-position inside the window
- * steers the divider: sliding left shrinks the settings pane, sliding
- * right shrinks the chat. Motion is eased (a quarter of the remaining
- * distance per event) so the panes glide instead of snapping.
- */
-static void on_root_motion(GtkEventControllerMotion *ctrl,
-                           double x, double y, gpointer data)
+/* deep copy for the request preview, base64 shortened to a stub that
+ * keeps the magic bytes image_mime() looks at */
+static Msg *preview_copy(const Msg *src)
 {
-    App *app = data;
-    int w, pos, diff, step;
+    Msg *m = msg_new(src->role, src->text);
+    guint k;
 
-    (void)ctrl;
-    (void)y;
-    if (!gtk_check_button_get_active(GTK_CHECK_BUTTON(app->ptr_cb)))
-        return;
+    if (src->images && src->images->len) {
+        m->images = g_ptr_array_new_with_free_func(g_free);
+        for (k = 0; k < src->images->len; k++) {
+            const char *b64 = g_ptr_array_index(src->images, k);
+            char *sz = g_format_size(strlen(b64));
 
-    w = gtk_widget_get_width(app->paned);
-    if (w < PANE_LEFT_MIN + PANE_RIGHT_MIN)
-        return;
-
-    if (x < PANE_LEFT_MIN)
-        x = PANE_LEFT_MIN;
-    if (x > w - PANE_RIGHT_MIN)
-        x = w - PANE_RIGHT_MIN;
-
-    pos  = gtk_paned_get_position(GTK_PANED(app->paned));
-    diff = (int)x - pos;
-    if (diff > -2 && diff < 2)
-        return;
-    step = diff / 4;
-    if (step == 0)
-        step = diff > 0 ? 1 : -1;
-    gtk_paned_set_position(GTK_PANED(app->paned), pos + step);
+            g_ptr_array_add(m->images,
+                            g_strdup_printf("%.12s…[%s base64]", b64, sz));
+            g_free(sz);
+        }
+    }
+    return m;
 }
 
-/* ------------------------------------------------------------------ */
-/* extract code / scripts / points from the reply                     */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  fenced code blocks                                                */
+/* ================================================================== */
 
 typedef struct {
-    char *lang;
+    char *lang;          /* lower-case info word, may be NULL */
+    char *name;          /* file name from the info string, may be NULL */
     char *code;
 } CodeBlock;
 
@@ -500,1559 +2261,1179 @@ static void code_block_free(gpointer p)
     CodeBlock *b = p;
 
     g_free(b->lang);
+    g_free(b->name);
     g_free(b->code);
     g_free(b);
 }
 
-/* length of a markdown list marker at p: "- ", "* ", "+ ", "1. ", "2) " … */
-static gsize list_marker_len(const char *p)
-{
-    gsize n = 0;
+static const struct { const char *lang, *ext; } LANG_EXT[] = {
+    { "python", "py" },   { "py", "py" },        { "c", "c" },
+    { "h", "h" },         { "cpp", "cpp" },      { "c++", "cpp" },
+    { "cxx", "cpp" },     { "cc", "cpp" },       { "hpp", "hpp" },
+    { "julia", "jl" },    { "jl", "jl" },        { "bash", "sh" },
+    { "sh", "sh" },       { "shell", "sh" },     { "zsh", "sh" },
+    { "console", "sh" },  { "javascript", "js" },{ "js", "js" },
+    { "typescript", "ts" },{ "ts", "ts" },       { "json", "json" },
+    { "html", "html" },   { "css", "css" },      { "rust", "rs" },
+    { "rs", "rs" },       { "go", "go" },        { "java", "java" },
+    { "kotlin", "kt" },   { "kt", "kt" },        { "r", "R" },
+    { "matlab", "m" },    { "octave", "m" },     { "sql", "sql" },
+    { "yaml", "yaml" },   { "yml", "yaml" },     { "toml", "toml" },
+    { "xml", "xml" },     { "cmake", "cmake" },  { "markdown", "md" },
+    { "md", "md" },       { "latex", "tex" },    { "tex", "tex" },
+    { "ini", "ini" },     { "swift", "swift" },  { "ruby", "rb" },
+    { "rb", "rb" },       { "perl", "pl" },      { "lua", "lua" },
+    { "fortran", "f90" }, { "glsl", "glsl" },    { "diff", "diff" },
+    { "patch", "patch" }, { "csv", "csv" },      { "powershell", "ps1" },
+    { "ps1", "ps1" },
+};
 
-    if (g_str_has_prefix(p, "- ") || g_str_has_prefix(p, "* ") ||
-        g_str_has_prefix(p, "+ "))
-        return 2;
-    while (g_ascii_isdigit(p[n]))
-        n++;
-    if (n && (p[n] == '.' || p[n] == ')') && p[n + 1] == ' ')
-        return n + 2;
-    return 0;
+/* basename only, harmless characters only; NULL if nothing usable */
+static char *safe_name(const char *s)
+{
+    char *b = g_path_get_basename(s), *p;
+
+    for (p = b; *p; p++)
+        if (!g_ascii_isalnum(*p) && !strchr("._-+", *p))
+            *p = '_';
+    if (!*b || !strcmp(b, ".") || !strcmp(b, "..")) {
+        g_free(b);
+        return NULL;
+    }
+    return b;
 }
 
-/* scan text for ```lang … ``` fences -> GPtrArray of CodeBlock* */
-static GPtrArray *extract_code_blocks(const char *text)
+static gboolean is_name_key(const char *k)
 {
-    GPtrArray *out = g_ptr_array_new_with_free_func(code_block_free);
-    GString *cur = NULL;
-    char *lang = NULL;
-    gboolean in = FALSE;
-    g_auto(GStrv) lines = g_strsplit(text ? text : "", "\n", -1);
+    return !g_ascii_strcasecmp(k, "title") || !g_ascii_strcasecmp(k, "file") ||
+           !g_ascii_strcasecmp(k, "filename") || !g_ascii_strcasecmp(k, "name");
+}
+
+/* ```python | ```{.python} | ```python:src/main.py | ```c title="x.c"
+ * | ```main.c */
+static void parse_info(const char *info, char **lang, char **name)
+{
+    char *s = g_strstrip(g_strdup(info));
+    char **tok = g_strsplit_set(s, " \t", -1);
     guint i;
 
-    for (i = 0; lines[i]; i++) {
-        char *line = lines[i];
-        const char *p;
+    *lang = NULL;
+    *name = NULL;
+    for (i = 0; tok[i]; i++) {
+        char *t = tok[i], *eq = strchr(t, '=');
+        gsize n;
 
-        g_strchomp(line);
-        p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-
-        if (g_str_has_prefix(p, "```")) {
-            if (!in) {                          /* opening fence */
-                char *tok, *sp;
-
-                g_free(lang);
-                tok = g_strstrip(g_strdup(p + 3));
-                sp = strpbrk(tok, " \t");       /* first token only */
-                if (sp)
-                    *sp = '\0';
-                lang = tok;
-                cur = g_string_new(NULL);
-                in = TRUE;
-            } else {                            /* closing fence */
-                CodeBlock *b = g_new0(CodeBlock, 1);
-
-                b->lang = g_strdup(lang ? lang : "");
-                b->code = g_string_free(cur, FALSE);
-                g_strchomp(b->code);
-                g_ptr_array_add(out, b);
-                cur = NULL;
-                in = FALSE;
-            }
+        if (!*t)
             continue;
-        }
-        if (in) {
-            g_string_append(cur, line);
-            g_string_append_c(cur, '\n');
-        }
-    }
-    if (in && cur) {                            /* unterminated fence: keep it */
-        CodeBlock *b = g_new0(CodeBlock, 1);
+        if (eq) {
+            char *v = eq + 1;
 
-        b->lang = g_strdup(lang ? lang : "");
-        b->code = g_string_free(cur, FALSE);
-        g_ptr_array_add(out, b);
-    }
-    g_free(lang);
-    return out;
-}
-
-static const char *ext_for_lang(const char *lang)
-{
-    static const struct { const char *l; const char *e; } map[] = {
-        { "c", "c" }, { "h", "h" },
-        { "cpp", "cpp" }, { "cc", "cpp" }, { "c++", "cpp" }, { "cxx", "cpp" },
-        { "python", "py" }, { "py", "py" },
-        { "bash", "sh" }, { "sh", "sh" }, { "shell", "sh" }, { "zsh", "sh" },
-        { "json", "json" },
-        { "javascript", "js" }, { "js", "js" },
-        { "typescript", "ts" }, { "ts", "ts" },
-        { "html", "html" }, { "css", "css" }, { "xml", "xml" },
-        { "yaml", "yml" }, { "yml", "yml" },
-        { "sql", "sql" },
-        { "rust", "rs" }, { "rs", "rs" },
-        { "go", "go" }, { "java", "java" }, { "lua", "lua" },
-        { "php", "php" }, { "markdown", "md" }, { "md", "md" },
-        { "csharp", "cs" }, { "cs", "cs" },
-        { "ruby", "rb" }, { "rb", "rb" },
-        { "perl", "pl" }, { "swift", "swift" }, { "kotlin", "kt" },
-        { "toml", "toml" }, { "ini", "ini" }, { "diff", "diff" },
-    };
-    char clean[16];
-    gsize i, n = 0;
-
-    if (!lang)
-        return "txt";
-    for (i = 0; lang[i] && n < sizeof(clean) - 1; i++)
-        if (g_ascii_isalnum(lang[i]) || lang[i] == '+' || lang[i] == '#')
-            clean[n++] = (char)g_ascii_tolower(lang[i]);
-    clean[n] = '\0';
-    if (!n)
-        return "txt";
-    for (i = 0; i < G_N_ELEMENTS(map); i++)
-        if (strcmp(clean, map[i].l) == 0)
-            return map[i].e;
-    return "txt";
-}
-
-/* headings + bullet / numbered items, excluding fenced code */
-static char *extract_points(const char *text)
-{
-    GString *out = g_string_new("# Key points extracted from the reply\n\n");
-    gboolean in_code = FALSE;
-    g_auto(GStrv) lines = g_strsplit(text ? text : "", "\n", -1);
-    guint i;
-
-    for (i = 0; lines[i]; i++) {
-        const char *p = lines[i];
-
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (g_str_has_prefix(p, "```")) {
-            in_code = !in_code;
-            continue;
-        }
-        if (in_code || !*p)
-            continue;
-        if (*p == '#' || list_marker_len(p) > 0) {
-            g_string_append(out, p);
-            g_string_append_c(out, '\n');
-        }
-    }
-    return g_string_free(out, FALSE);
-}
-
-typedef enum {
-    EXTRACT_CODE = 0,
-    EXTRACT_POINTS
-} ExtractKind;
-
-typedef struct {
-    App         *app;
-    ExtractKind  kind;
-} ExtractJob;
-
-static void extraction_write(App *app, ExtractKind kind, const char *base_dir)
-{
-    char *src = (app->last_response && *app->last_response)
-                    ? g_strdup(app->last_response)
-                    : buffer_text(app->chat_buf);
-    GDateTime *now = g_date_time_new_now_local();
-    char *stamp = g_date_time_format(now, "%Y%m%d-%H%M%S");
-    char *outdir = g_build_filename(base_dir, "ollama-extract", stamp, NULL);
-    GError *err = NULL;
-    int saved = 0, found = 0;
-
-    g_date_time_unref(now);
-
-    if (g_mkdir_with_parents(outdir, 0755) != 0) {
-        show_error(app, "Cannot create output directory");
-        goto done;
-    }
-
-    if (kind == EXTRACT_CODE) {
-        GPtrArray *blocks = extract_code_blocks(src);
-        guint i;
-
-        found = (int)blocks->len;
-        for (i = 0; i < blocks->len; i++) {
-            CodeBlock *b = g_ptr_array_index(blocks, i);
-            char *name = g_strdup_printf("code_%02u.%s", i + 1,
-                                         ext_for_lang(b->lang));
-            char *path = g_build_filename(outdir, name, NULL);
-
-            if (g_file_set_contents(path, b->code, -1, &err))
-                saved++;
-            else {
-                show_error(app, err->message);
-                g_clear_error(&err);
-            }
-            g_free(path);
-            g_free(name);
-        }
-        g_ptr_array_free(blocks, TRUE);
-        if (!found)
-            set_status(app, "No ``` code blocks found in the reply");
-    } else {
-        char *doc  = extract_points(src);
-        char *path = g_build_filename(outdir, "points.md", NULL);
-
-        found = 1;
-        if (g_file_set_contents(path, doc, -1, &err))
-            saved = 1;
-        else {
-            show_error(app, err->message);
-            g_clear_error(&err);
-        }
-        g_free(path);
-        g_free(doc);
-    }
-    if (saved)
-        set_status(app, "%d file%s saved -> %s",
-                   saved, saved == 1 ? "" : "s", outdir);
-
-done:
-    g_free(outdir);
-    g_free(stamp);
-    g_free(src);
-}
-
-static void on_extract_dir(GObject *src, GAsyncResult *res, gpointer data)
-{
-    ExtractJob *job = data;
-    GFile *dir = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src),
-                                                      res, NULL);
-
-    if (dir) {
-        char *path = g_file_get_path(dir);
-
-        if (path) {
-            extraction_write(job->app, job->kind, path);
-            g_free(path);
-        }
-        g_object_unref(dir);
-    }
-    g_free(job);
-}
-
-static void start_extract(App *app, ExtractKind kind, const char *title)
-{
-    ExtractJob *job = g_new0(ExtractJob, 1);
-    GtkFileDialog *d = gtk_file_dialog_new();
-
-    job->app = app;
-    job->kind = kind;
-    gtk_file_dialog_set_title(d, title);
-    gtk_file_dialog_select_folder(d, app->win, NULL, on_extract_dir, job);
-    g_object_unref(d);
-}
-
-static void on_extract_code(GtkButton *b, gpointer data)
-{
-    (void)b;
-    start_extract(data, EXTRACT_CODE, "Save extracted code into folder");
-}
-
-static void on_extract_points(GtkButton *b, gpointer data)
-{
-    (void)b;
-    start_extract(data, EXTRACT_POINTS, "Save reply outline into folder");
-}
-
-/* ------------------------------------------------------------------ */
-/* colourful rendering of answers                                     */
-/* ------------------------------------------------------------------ */
-
-static void ensure_tags(App *app)
-{
-    if (app->tags_ready)
-        return;
-    app->tags_ready = TRUE;
-
-    /* markdown-ish line tags */
-    gtk_text_buffer_create_tag(app->chat_buf, "h1",
-        "weight", PANGO_WEIGHT_BOLD, "scale", 1.4,  "foreground", "#d63384", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "h2",
-        "weight", PANGO_WEIGHT_BOLD, "scale", 1.25, "foreground", "#6f42c1", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "h3",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#0d6efd", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "code",
-        "family", "monospace", "paragraph-background", "#161b22",
-        "foreground", "#e6edf3", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "fence",
-        "family", "monospace", "paragraph-background", "#161b22",
-        "foreground", "#7d8590", "scale", 0.85, NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "icode",
-        "family", "monospace", "background", "#eef1f4",
-        "foreground", "#c7254e", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "strong",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#b35900", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "ulink",
-        "foreground", "#0d6efd", "underline", PANGO_UNDERLINE_SINGLE, NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "quote",
-        "style", PANGO_STYLE_ITALIC, "foreground", "#1a7f37", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "bullet",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#8250df", NULL);
-    /* app role headers */
-    gtk_text_buffer_create_tag(app->chat_buf, "urole",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#1a7f37", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "arole",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#0d6efd", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "err",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#cf222e", NULL);
-    /* inside fenced code — github-dark-ish palette */
-    gtk_text_buffer_create_tag(app->chat_buf, "kw",  "foreground", "#ff7b72", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "str", "foreground", "#a5d6ff", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "num", "foreground", "#79c0ff", NULL);
-    gtk_text_buffer_create_tag(app->chat_buf, "cmt", "foreground", "#8b949e",
-        "style", PANGO_STYLE_ITALIC, NULL);
-    /* clickable header of a collapsible thinking block */
-    gtk_text_buffer_create_tag(app->chat_buf, "thead",
-        "weight", PANGO_WEIGHT_BOLD, "foreground", "#6f42c1", NULL);
-    /* per-message alignment: the user's turn is right-justified and sits on a
-     * green paragraph band; the assistant's turn keeps the default (left). */
-    {
-        GtkTextTag *ublock = gtk_text_buffer_create_tag(app->chat_buf, "ublock",
-            "justification", GTK_JUSTIFY_RIGHT,
-            "paragraph-background", "#d4edda", NULL);
-        /* lowest priority, so a fenced code block inside a question keeps its
-         * dark background; justification is set only here, so it still wins. */
-        gtk_text_tag_set_priority(ublock, 0);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* collapsible "thinking" blocks                                       */
-/* ------------------------------------------------------------------ */
-
-static void think_block_free(gpointer p)
-{
-    ThinkBlock *blk = p;
-
-    g_free(blk->body_tag);
-    g_free(blk);
-}
-
-/* set the disclosure arrow on a block's header to match its state */
-static void think_set_arrow(App *app, ThinkBlock *blk)
-{
-    GtkTextIter a, b;
-    char *cur;
-    const char *want = blk->expanded ? "\xE2\x96\xBE"    /* down triangle */
-                                     : "\xE2\x96\xB8";   /* right triangle */
-
-    if (!blk->head_start)
-        return;
-    gtk_text_buffer_get_iter_at_mark(app->chat_buf, &a, blk->head_start);
-    b = a;
-    if (!gtk_text_iter_forward_char(&b))
-        return;
-    cur = gtk_text_buffer_get_text(app->chat_buf, &a, &b, FALSE);
-    if (g_strcmp0(cur, want) != 0) {
-        gtk_text_buffer_delete(app->chat_buf, &a, &b);
-        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &a, blk->head_start);
-        gtk_text_buffer_insert(app->chat_buf, &a, want, -1);
-    }
-    g_free(cur);
-}
-
-/* (re-)apply the header and body tags for one block, honouring its state */
-static void think_apply_one(App *app, ThinkBlock *blk)
-{
-    GtkTextIter hs, bs, be;
-    GtkTextTag *body;
-
-    if (!blk->head_start || !blk->body_start)
-        return;
-
-    body = gtk_text_tag_table_lookup(
-        gtk_text_buffer_get_tag_table(app->chat_buf), blk->body_tag);
-    if (body)
-        g_object_set(body, "invisible", !blk->expanded, NULL);
-
-    gtk_text_buffer_get_iter_at_mark(app->chat_buf, &hs, blk->head_start);
-    gtk_text_buffer_get_iter_at_mark(app->chat_buf, &bs, blk->body_start);
-    gtk_text_buffer_apply_tag_by_name(app->chat_buf, "thead", &hs, &bs);
-
-    if (blk->body_end && body) {
-        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &be, blk->body_end);
-        gtk_text_buffer_apply_tag(app->chat_buf, body, &bs, &be);
-    }
-}
-
-/* re-apply every block's tags — used after a full re-render wipes them */
-static void think_apply_all(App *app)
-{
-    guint i;
-
-    if (!app->think_blocks)
-        return;
-    for (i = 0; i < app->think_blocks->len; i++)
-        think_apply_one(app, g_ptr_array_index(app->think_blocks, i));
-}
-
-/* flip one block open/closed in response to a click on its header */
-static void think_toggle(App *app, ThinkBlock *blk)
-{
-    blk->expanded = !blk->expanded;
-    think_set_arrow(app, blk);
-    think_apply_one(app, blk);
-}
-
-/* drop every block (new chat / buffer reset); call BEFORE clearing text */
-static void think_clear(App *app)
-{
-    GtkTextTagTable *tab = gtk_text_buffer_get_tag_table(app->chat_buf);
-    guint i;
-
-    if (!app->think_blocks)
-        return;
-    for (i = 0; i < app->think_blocks->len; i++) {
-        ThinkBlock *blk = g_ptr_array_index(app->think_blocks, i);
-        GtkTextTag *t = gtk_text_tag_table_lookup(tab, blk->body_tag);
-
-        if (t)
-            gtk_text_tag_table_remove(tab, t);
-        if (blk->head_start)
-            gtk_text_buffer_delete_mark(app->chat_buf, blk->head_start);
-        if (blk->body_start)
-            gtk_text_buffer_delete_mark(app->chat_buf, blk->body_start);
-        if (blk->body_end)
-            gtk_text_buffer_delete_mark(app->chat_buf, blk->body_end);
-    }
-    g_ptr_array_set_size(app->think_blocks, 0);
-    app->think_current = NULL;
-}
-
-/*
- * Tag the [from, to) byte range of 'base' (the text that starts at the
- * 'block_start' iter). Byte offsets are converted to character offsets.
- */
-static void tag_span(App *app, GtkTextIter *block_start, const char *base,
-                     const char *from, const char *to, const char *tag)
-{
-    GtkTextIter a = *block_start, b = *block_start;
-
-    gtk_text_iter_forward_chars(&a, (gint)g_utf8_strlen(base, (gssize)(from - base)));
-    gtk_text_iter_forward_chars(&b, (gint)g_utf8_strlen(base, (gssize)(to - base)));
-    gtk_text_buffer_apply_tag_by_name(app->chat_buf, tag, &a, &b);
-}
-
-static gboolean is_ident(char c)
-{
-    return g_ascii_isalnum(c) || c == '_';
-}
-
-static gboolean is_keyword(const char *s, gsize n)
-{
-    static const char *const kws[] = {
-        /* C / C-like */
-        "if", "else", "for", "while", "do", "switch", "case", "default",
-        "break", "continue", "return", "goto", "sizeof", "typedef",
-        "struct", "union", "enum", "static", "const", "volatile", "extern",
-        "inline", "void", "char", "short", "int", "long", "float",
-        "double", "signed", "unsigned", "bool", "true", "false", "NULL",
-        /* python */
-        "def", "class", "import", "from", "in", "is", "None", "and", "or",
-        "not", "pass", "lambda", "with", "as", "try", "except", "finally",
-        "raise", "yield", "global", "elif",
-        /* rust / go / js / shell misc */
-        "fn", "let", "mut", "pub", "impl", "match", "use", "func", "var",
-        "new", "this", "function", "package", "local", "then", "fi",
-        "done", "echo", "print", "public", "private", "async", "await",
-        NULL
-    };
-    int i;
-
-    for (i = 0; kws[i]; i++)
-        if (strlen(kws[i]) == n && strncmp(kws[i], s, n) == 0)
-            return TRUE;
-    return FALSE;
-}
-
-/* lightweight tokenizer for strings / comments / numbers / keywords */
-static void highlight_code(App *app, GtkTextIter *start, GtkTextIter *end)
-{
-    char *code = gtk_text_buffer_get_text(app->chat_buf, start, end, FALSE);
-    const char *p = code;
-
-    while (*p) {
-        const char *to = NULL, *tag = NULL;
-
-        if (p[0] == '/' && p[1] == '/') {
-            to = strchr(p, '\n');
-            if (!to)
-                to = p + strlen(p);
-            tag = "cmt";
-        } else if (p[0] == '/' && p[1] == '*') {
-            to = strstr(p + 2, "*/");
-            to = to ? to + 2 : p + strlen(p);
-            tag = "cmt";
-        } else if (*p == '#') {                 /* python / shell comment */
-            to = strchr(p, '\n');
-            if (!to)
-                to = p + strlen(p);
-            tag = "cmt";
-        } else if (*p == '"' || *p == '\'') {
-            char q = *p;
-            const char *s = p + 1;
-
-            while (*s && *s != q) {
-                if (*s == '\\' && s[1])
-                    s++;
-                s++;
-            }
-            to = (*s == q) ? s + 1 : s;
-            tag = "str";
-        } else if (g_ascii_isdigit(*p)) {
-            const char *s = p;
-
-            while (*s && (is_ident(*s) || *s == '.'))
-                s++;
-            to = s;
-            tag = "num";
-        } else if (g_ascii_isalpha(*p) || *p == '_') {
-            const char *s = p;
-
-            while (is_ident(*s))
-                s++;
-            if (is_keyword(p, (gsize)(s - p)))
-                tag_span(app, start, code, p, s, "kw");
-            p = s;
-            continue;
-        }
-        if (tag) {
-            tag_span(app, start, code, p, to, tag);
-            p = to;
-        } else {
-            p++;
-        }
-    }
-    g_free(code);
-}
-
-/* inline `code`, **bold** and URLs inside one line */
-static void highlight_inline_md(App *app, GtkTextIter *line_start_after_indent,
-                                const char *text)
-{
-    const char *p = text;
-
-    while (*p) {
-        if (*p == '`') {
-            const char *q = strchr(p + 1, '`');
-
-            if (q) {
-                tag_span(app, line_start_after_indent, text, p + 1, q, "icode");
-                p = q + 1;
+            *eq = '\0';
+            if (*name || !is_name_key(t))
                 continue;
+            if (*v == '"' || *v == '\'')
+                v++;
+            n = strlen(v);
+            if (n && (v[n - 1] == '"' || v[n - 1] == '\''))
+                v[n - 1] = '\0';
+            *name = safe_name(v);
+        } else if (!*lang) {
+            char *colon;
+
+            while (*t == '{' || *t == '.')
+                t++;
+            n = strlen(t);
+            if (n && t[n - 1] == '}')
+                t[n - 1] = '\0';
+            colon = strchr(t, ':');
+            if (colon) {
+                *colon = '\0';
+                if (!*name && colon[1])
+                    *name = safe_name(colon + 1);
             }
-        } else if (p[0] == '*' && p[1] == '*') {
-            const char *q = strstr(p + 2, "**");
-
-            if (q && q > p + 2) {
-                tag_span(app, line_start_after_indent, text, p + 2, q, "strong");
-                p = q + 2;
-                continue;
-            }
-        } else if (g_str_has_prefix(p, "http://") ||
-                   g_str_has_prefix(p, "https://")) {
-            const char *q = p;
-
-            while (*q && !g_ascii_isspace(*q) && *q != ')' &&
-                   *q != '"' && *q != '<')
-                q++;
-            tag_span(app, line_start_after_indent, text, p, q, "ulink");
-            p = q;
-            continue;
-        }
-        p++;
-    }
-}
-
-/*
- * Re-scan the whole chat buffer: clear all tags and apply the colourful
- * representation. Runs once per completed reply (cheap even for long
- * logs), so streaming stays plain and only the final render is decorated.
- */
-static void re_render_chat(App *app)
-{
-    GtkTextIter line, s, e, fence_open = { 0 };
-    GtkTextIter ublk_start = { 0 };
-    gboolean in_code = FALSE;
-    gboolean in_user = FALSE;
-
-    ensure_tags(app);
-    gtk_text_buffer_get_bounds(app->chat_buf, &s, &e);
-    gtk_text_buffer_remove_all_tags(app->chat_buf, &s, &e);
-
-    gtk_text_buffer_get_start_iter(app->chat_buf, &line);
-    while (TRUE) {
-        GtkTextIter lend = line, t0;
-        char *ltxt;
-        const char *p;
-        gsize mark;
-
-        gtk_text_iter_forward_to_line_end(&lend);
-        ltxt = gtk_text_buffer_get_text(app->chat_buf, &line, &lend, FALSE);
-        p = ltxt;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        t0 = line;
-        gtk_text_iter_forward_chars(&t0, (gint)(p - ltxt)); /* past indent */
-
-        if (g_str_has_prefix(p, "```")) {
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf, "fence", &line, &lend);
-            if (!in_code) {
-                fence_open = line;
-                in_code = TRUE;
-            } else {
-                GtkTextIter body = fence_open;
-
-                gtk_text_iter_forward_line(&body);
-                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "code",
-                                                  &body, &line);
-                highlight_code(app, &body, &line);
-                in_code = FALSE;
-            }
-        } else if (in_code) {
-            /* tagged when the closing fence is reached */
-        } else if (*p == '#') {
-            int n = 1;
-
-            while (p[n] == '#')
-                n++;
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf,
-                n == 1 ? "h1" : n == 2 ? "h2" : "h3", &line, &lend);
-        } else if (g_str_has_prefix(p, "> ")) {
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf, "quote", &line, &lend);
-        } else if ((mark = list_marker_len(p)) > 0) {
-            GtkTextIter m1 = t0;
-
-            gtk_text_iter_forward_chars(&m1, (gint)mark); /* ASCII markers */
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf, "bullet", &t0, &m1);
-            highlight_inline_md(app, &m1, p + mark);
-        } else if (g_str_has_prefix(p, "[You")) {
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf, "urole", &line, &lend);
-            if (in_user)        /* close a previous (unterminated) question */
-                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
-                                                  &ublk_start, &line);
-            ublk_start = line;  /* this question starts here */
-            in_user = TRUE;
-        } else if (g_str_has_prefix(p, "[Assistant")) {
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf, "arole", &line, &lend);
-            if (in_user) {      /* the question ends where the answer begins */
-                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
-                                                  &ublk_start, &line);
-                in_user = FALSE;
-            }
-        } else if (g_str_has_prefix(p, "[Error")) {
-            gtk_text_buffer_apply_tag_by_name(app->chat_buf, "err", &line, &lend);
-            if (in_user) {
-                gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
-                                                  &ublk_start, &line);
-                in_user = FALSE;
-            }
-        } else if (*p) {
-            highlight_inline_md(app, &t0, p);
-        }
-
-        g_free(ltxt);
-        if (!gtk_text_iter_forward_line(&line))
-            break;
-    }
-    if (in_code) {                      /* unterminated fence (mid-stream) */
-        GtkTextIter body = fence_open, e2;
-
-        gtk_text_iter_forward_line(&body);
-        gtk_text_buffer_get_end_iter(app->chat_buf, &e2);
-        gtk_text_buffer_apply_tag_by_name(app->chat_buf, "code", &body, &e2);
-        highlight_code(app, &body, &e2);
-    }
-    if (in_user) {                      /* a question with no answer yet */
-        GtkTextIter e2;
-
-        gtk_text_buffer_get_end_iter(app->chat_buf, &e2);
-        gtk_text_buffer_apply_tag_by_name(app->chat_buf, "ublock",
-                                          &ublk_start, &e2);
-    }
-    think_apply_all(app);               /* keep thinking blocks collapsed */
-}
-
-static void on_colour_toggled(GtkToggleButton *tb, gpointer data)
-{
-    App *app = data;
-
-    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(tb)))
-        re_render_chat(app);
-    else {
-        GtkTextIter s, e;
-
-        gtk_text_buffer_get_bounds(app->chat_buf, &s, &e);
-        gtk_text_buffer_remove_all_tags(app->chat_buf, &s, &e);
-        think_apply_all(app);           /* thinking stays collapsed even raw */
-    }
-}
-
-/* decorate once, when a reply is complete */
-static void finish_render(App *app)
-{
-    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(app->colour_cb)))
-        re_render_chat(app);
-}
-
-/* ------------------------------------------------------------------ */
-/* request building                                                    */
-/* ------------------------------------------------------------------ */
-
-static void add_number_option(JsonObject *o, const char *key,
-                              GtkWidget *entry, gboolean as_int)
-{
-    const char *t = gtk_editable_get_text(GTK_EDITABLE(entry));
-    char *s, *endp = NULL;
-
-    if (!t)
-        return;
-    s = g_strstrip(g_strdup(t));
-    if (*s) {
-        if (as_int) {
-            gint64 v = g_ascii_strtoll(s, &endp, 10);
-
-            if (endp && *endp == '\0')
-                json_object_set_int_member(o, key, v);
-        } else {
-            double v = g_ascii_strtod(s, &endp);
-
-            if (endp && *endp == '\0')
-                json_object_set_double_member(o, key, v);
+            if (*t)
+                *lang = g_ascii_strdown(t, -1);
         }
     }
+    if (*lang && strchr(*lang, '.') && !*name) {   /* ```main.c */
+        char *ext = g_strdup(strrchr(*lang, '.') + 1);
+
+        *name = safe_name(*lang);
+        g_free(*lang);
+        *lang = ext;
+    }
+    g_strfreev(tok);
     g_free(s);
 }
 
-static JsonObject *collect_options(App *app)
+/* CommonMark-style fences: 3+ backticks or tildes, indented <= 3 spaces,
+ * closed by a run of the same character at least as long. An unclosed
+ * block (reply stopped mid-stream) is kept. */
+static GPtrArray *extract_code(const char *md)
 {
-    JsonObject *o = json_object_new();
+    GPtrArray *out = g_ptr_array_new_with_free_func(code_block_free);
+    const char *p = md ? md : "";
+    GString *body = NULL;
+    char fch = 0, *lang = NULL, *name = NULL;
+    gsize flen = 0;
 
-    add_number_option(o, "temperature", app->temp_e, FALSE);
-    add_number_option(o, "top_p", app->topp_e, FALSE);
-    add_number_option(o, "num_ctx", app->ctx_e, TRUE);
-    add_number_option(o, "num_predict", app->npred_e, TRUE);
-    add_number_option(o, "seed", app->seed_e, TRUE);
-    if (json_object_get_size(o) == 0) {
-        json_object_unref(o);
-        return NULL;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        gsize llen = eol ? (gsize)(eol - p) : strlen(p);
+        gsize i = 0, run = 0;
+        char c;
+
+        while (i < 3 && i < llen && p[i] == ' ')
+            i++;
+        c = (i < llen) ? p[i] : '\0';
+        if (c == '`' || c == '~')
+            while (i + run < llen && p[i + run] == c)
+                run++;
+
+        if (!body) {
+            if (run >= 3) {
+                char *info = g_strndup(p + i + run, llen - i - run);
+
+                if (!(c == '`' && strchr(info, '`'))) {   /* not inline */
+                    parse_info(info, &lang, &name);
+                    fch = c;
+                    flen = run;
+                    body = g_string_new(NULL);
+                }
+                g_free(info);
+            }
+        } else {
+            gsize j = i + run;
+
+            while (j < llen && (p[j] == ' ' || p[j] == '\t' || p[j] == '\r'))
+                j++;
+            if (c == fch && run >= flen && j == llen) {   /* closing fence */
+                CodeBlock *b = g_new0(CodeBlock, 1);
+
+                b->lang = lang;
+                b->name = name;
+                b->code = g_string_free(body, FALSE);
+                lang = name = NULL;
+                body = NULL;
+                if (*b->code)
+                    g_ptr_array_add(out, b);
+                else
+                    code_block_free(b);
+            } else {
+                g_string_append_len(body, p, (gssize)llen);
+                g_string_append_c(body, '\n');
+            }
+        }
+        if (!eol)
+            break;
+        p = eol + 1;
     }
-    return o;
+    if (body && body->len) {
+        CodeBlock *b = g_new0(CodeBlock, 1);
+
+        b->lang = lang;
+        b->name = name;
+        b->code = g_string_free(body, FALSE);
+        g_ptr_array_add(out, b);
+    } else {
+        if (body)
+            g_string_free(body, TRUE);
+        g_free(lang);
+        g_free(name);
+    }
+    return out;
 }
 
-static void add_string_array(JsonBuilder *b, const char *member,
-                             GPtrArray *strings)
+static char *code_file_name(const CodeBlock *b, guint idx, guint total)
 {
+    const char *ext = "txt";
     guint i;
 
-    json_builder_set_member_name(b, member);
-    json_builder_begin_array(b);
-    for (i = 0; i < strings->len; i++)
-        json_builder_add_string_value(b, g_ptr_array_index(strings, i));
-    json_builder_end_array(b);
+    if (b->name)
+        return g_strdup(b->name);
+    if (b->lang) {
+        if (!strcmp(b->lang, "make") || !strcmp(b->lang, "makefile"))
+            return g_strdup("Makefile");
+        if (!strcmp(b->lang, "dockerfile"))
+            return g_strdup("Dockerfile");
+        for (i = 0; i < G_N_ELEMENTS(LANG_EXT); i++)
+            if (!strcmp(LANG_EXT[i].lang, b->lang)) {
+                ext = LANG_EXT[i].ext;
+                break;
+            }
+    }
+    return total > 1 ? g_strdup_printf("snippet-%02u.%s", idx + 1, ext)
+                     : g_strdup_printf("snippet.%s", ext);
 }
 
-/*
- * Returns the payload node (caller frees), and through umsg_out the user
- * message that was appended, so the caller can push it into the history.
- */
-static JsonNode *build_payload(App *app, const char *text, int *endpoint_out,
-                               JsonNode **umsg_out, GError **err)
+/* code blocks of the most recent assistant reply that has any */
+static GPtrArray *last_code_blocks(App *app)
 {
-    GString *content = g_string_new(NULL);
-    GPtrArray *images = g_ptr_array_new_with_free_func(g_free);
-    JsonNode *schema = NULL;
-    const char *simple_format = NULL;
-    JsonBuilder *b;
-    JsonNode *umsg = NULL;
-    JsonNode *root = NULL;
-    JsonObject *opts;
-    char *sys = NULL;
-    char *keep = NULL;
-    guint fsel;
-    int ep = selected_endpoint(app);
-    gboolean streaming = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb));
+    guint i = app->history->len;
 
-    if (!build_user_content(app, text, content, images, err))
-        goto fail;
+    while (i-- > 0) {
+        Msg *m = g_ptr_array_index(app->history, i);
+        GPtrArray *b;
 
-    fsel = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->format_dd));
-    if (fsel == 1) {
-        simple_format = "json";
-    } else if (fsel == 2) {
-        char *raw = buffer_text(app->schema_buf);
-
-        g_strstrip(raw);
-        if (*raw == '\0') {
-            simple_format = "json";
-        } else {
-            JsonParser *p = json_parser_new();
-
-            if (!json_parser_load_from_data(p, raw, -1, err)) {
-                g_object_unref(p);
-                g_free(raw);
-                goto fail;
-            }
-            schema = json_node_copy(json_parser_get_root(p));
-            g_object_unref(p);
-        }
-        g_free(raw);
+        if (g_strcmp0(m->role, "assistant"))
+            continue;
+        b = extract_code(m->text);
+        if (b->len)
+            return b;
+        g_ptr_array_unref(b);
     }
-
-    if (schema && gtk_check_button_get_active(GTK_CHECK_BUTTON(app->ground_cb))) {
-        char *ss = node_to_string(schema, FALSE);
-
-        g_string_append_printf(content,
-                               "\n\nRespond with JSON matching this schema:\n%s",
-                               ss);
-        g_free(ss);
-    }
-
-    /* the user message */
-    b = json_builder_new();
-    json_builder_begin_object(b);
-    json_builder_set_member_name(b, "role");
-    json_builder_add_string_value(b, "user");
-    json_builder_set_member_name(b, "content");
-    json_builder_add_string_value(b, content->str);
-    if (images->len)
-        add_string_array(b, "images", images);
-    json_builder_end_object(b);
-    umsg = json_builder_get_root(b);
-    g_object_unref(b);
-
-    /* the payload */
-    sys = buffer_text(app->sys_buf);
-    g_strstrip(sys);
-    b = json_builder_new();
-    json_builder_begin_object(b);
-    json_builder_set_member_name(b, "model");
-    json_builder_add_string_value(b, selected_model(app));
-    json_builder_set_member_name(b, "stream");
-    json_builder_add_boolean_value(b, streaming);
-
-    if (ep == 0) {
-        json_builder_set_member_name(b, "messages");
-        json_builder_begin_array(b);
-        if (*sys) {
-            json_builder_begin_object(b);
-            json_builder_set_member_name(b, "role");
-            json_builder_add_string_value(b, "system");
-            json_builder_set_member_name(b, "content");
-            json_builder_add_string_value(b, sys);
-            json_builder_end_object(b);
-        }
-        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(app->hist_cb))) {
-            guint i, n = json_array_get_length(app->messages);
-
-            for (i = 0; i < n; i++)
-                json_builder_add_value(b,
-                    json_node_copy(json_array_get_element(app->messages, i)));
-        }
-        json_builder_add_value(b, json_node_copy(umsg));
-        json_builder_end_array(b);
-    } else {
-        json_builder_set_member_name(b, "prompt");
-        json_builder_add_string_value(b, content->str);
-        if (images->len)
-            add_string_array(b, "images", images);
-        if (*sys) {
-            json_builder_set_member_name(b, "system");
-            json_builder_add_string_value(b, sys);
-        }
-    }
-
-    if (simple_format) {
-        json_builder_set_member_name(b, "format");
-        json_builder_add_string_value(b, simple_format);
-    } else if (schema) {
-        json_builder_set_member_name(b, "format");
-        json_builder_add_value(b, json_node_copy(schema));
-    }
-
-    opts = collect_options(app);
-    if (opts) {
-        JsonNode *n = json_node_new(JSON_NODE_OBJECT);
-
-        json_node_take_object(n, opts);
-        json_builder_set_member_name(b, "options");
-        json_builder_add_value(b, n);
-    }
-
-    keep = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(app->keep_e))));
-    if (*keep) {
-        json_builder_set_member_name(b, "keep_alive");
-        json_builder_add_string_value(b, keep);
-    }
-    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(app->think_cb))) {
-        json_builder_set_member_name(b, "think");
-        json_builder_add_boolean_value(b, TRUE);
-    }
-    json_builder_end_object(b);
-    root = json_builder_get_root(b);
-    g_object_unref(b);
-
-    *endpoint_out = ep;
-    *umsg_out = umsg;
-    g_free(sys);
-    g_free(keep);
-    if (schema)
-        json_node_free(schema);
-    g_string_free(content, TRUE);
-    g_ptr_array_free(images, TRUE);
-    return root;
-
-fail:
-    if (schema)
-        json_node_free(schema);
-    g_string_free(content, TRUE);
-    g_ptr_array_free(images, TRUE);
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* transport: worker thread + idle callbacks into the main loop        */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  file dialogs: attach, save chat, save code                        */
+/* ================================================================== */
+
+/* TRUE when the dialog produced nothing; silent if the user cancelled */
+static gboolean dialog_aborted(App *app, GError *err)
+{
+    if (!err)
+        return app->closing;
+    if (!app->closing &&
+        !g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED) &&
+        !g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_CANCELLED))
+        show_error(app, err->message);
+    g_error_free(err);
+    return TRUE;
+}
+
+static gboolean write_text(GFile *f, const char *data, char **why)
+{
+    GError *err = NULL;
+
+    if (g_file_replace_contents(f, data, strlen(data), NULL, FALSE,
+                                G_FILE_CREATE_NONE, NULL, NULL, &err))
+        return TRUE;
+    *why = g_strdup(err->message);
+    g_error_free(err);
+    return FALSE;
+}
+
+static void attach_done(GObject *src, GAsyncResult *res, gpointer data)
+{
+    App *app = data;
+    GError *err = NULL;
+    GListModel *files = gtk_file_dialog_open_multiple_finish(
+                            GTK_FILE_DIALOG(src), res, &err);
+    GString *bad;
+    guint i, n, added = 0;
+
+    if (dialog_aborted(app, err) || !files) {
+        if (files)
+            g_object_unref(files);
+        return;
+    }
+    bad = g_string_new(NULL);
+    n = g_list_model_get_n_items(files);
+    for (i = 0; i < n; i++) {
+        GFile *f = g_list_model_get_item(files, i);
+        char *why = NULL;
+        Attachment *a = attachment_load(f, &why);
+
+        if (a) {
+            g_ptr_array_add(app->att, a);
+            added++;
+        } else {
+            g_string_append_printf(bad, "%s\n", why);
+            g_free(why);
+        }
+        g_object_unref(f);
+    }
+    g_object_unref(files);
+    att_refresh(app);
+    set_status(app, "%u file%s attached", added, added == 1 ? "" : "s");
+    if (bad->len)
+        show_error(app, bad->str);
+    g_string_free(bad, TRUE);
+}
+
+static void add_filter(GListStore *s, const char *label,
+                       const char *mime, const char *pattern)
+{
+    GtkFileFilter *f = gtk_file_filter_new();
+
+    gtk_file_filter_set_name(f, label);
+    if (mime)
+        gtk_file_filter_add_mime_type(f, mime);
+    if (pattern)
+        gtk_file_filter_add_pattern(f, pattern);
+    g_list_store_append(s, f);
+    g_object_unref(f);
+}
+
+static void on_attach(GtkButton *b, gpointer data)
+{
+    App *app = data;
+    GtkFileDialog *d = gtk_file_dialog_new();
+    GListStore *flt = g_list_store_new(GTK_TYPE_FILE_FILTER);
+
+    (void)b;
+    add_filter(flt, "All files", NULL, "*");
+    add_filter(flt, "Images", "image/*", NULL);
+    add_filter(flt, "Text", "text/*", NULL);
+    gtk_file_dialog_set_title(d, "Attach images or text files");
+    gtk_file_dialog_set_filters(d, G_LIST_MODEL(flt));
+    g_object_unref(flt);
+    gtk_file_dialog_open_multiple(d, app->win, NULL, attach_done, app);
+    g_object_unref(d);                     /* the async task holds a ref */
+}
+
+static void on_att_clear(GtkButton *b, gpointer data)
+{
+    App *app = data;
+
+    (void)b;
+    g_ptr_array_set_size(app->att, 0);
+    att_refresh(app);
+}
+
+static char *chat_markdown(App *app)
+{
+    GString *s = g_string_new(NULL);
+    GDateTime *now = g_date_time_new_now_local();
+    char *ts = g_date_time_format(now, "%Y-%m-%d %H:%M");
+    guint i;
+
+    g_string_append_printf(s, "# Chat transcript\n\n*%s · %s · %s*\n",
+        prov_get(app->prov_id)->label,
+        gtk_editable_get_text(GTK_EDITABLE(app->model_entry)), ts);
+    for (i = 0; i < app->history->len; i++) {
+        Msg *m = g_ptr_array_index(app->history, i);
+        const char *who = !g_strcmp0(m->role, "system")    ? "System"
+                        : !g_strcmp0(m->role, "assistant") ? "Assistant"
+                                                           : "User";
+
+        g_string_append_printf(s, "\n## %s\n\n%s\n", who, m->text ? m->text : "");
+        if (m->images && m->images->len)
+            g_string_append_printf(s, "\n*(%u image%s attached)*\n",
+                                   m->images->len,
+                                   m->images->len == 1 ? "" : "s");
+    }
+    g_free(ts);
+    g_date_time_unref(now);
+    return g_string_free(s, FALSE);
+}
+
+/* canonical history, images included: a faithful archive */
+static char *chat_json(App *app)
+{
+    JsonObject *root = json_object_new();
+    JsonNode *node = json_node_new(JSON_NODE_OBJECT);
+    GDateTime *now = g_date_time_new_now_local();
+    char *ts = g_date_time_format_iso8601(now), *out;
+
+    json_object_set_string_member(root, "provider",
+                                  prov_get(app->prov_id)->id_name);
+    json_object_set_string_member(root, "model",
+        gtk_editable_get_text(GTK_EDITABLE(app->model_entry)));
+    json_object_set_string_member(root, "saved", ts);
+    json_object_set_array_member(root, "messages",
+                                 ollama_messages(app->history));
+    json_node_take_object(node, root);
+    out = node_to_string(node, TRUE);
+    json_node_unref(node);
+    g_free(ts);
+    g_date_time_unref(now);
+    return out;
+}
+
+static void save_chat_done(GObject *src, GAsyncResult *res, gpointer data)
+{
+    App *app = data;
+    GError *err = NULL;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, &err);
+    char *base, *lower, *body, *why = NULL;
+
+    if (dialog_aborted(app, err) || !f) {
+        if (f)
+            g_object_unref(f);
+        return;
+    }
+    base = g_file_get_basename(f);
+    lower = g_ascii_strdown(base, -1);
+    body = g_str_has_suffix(lower, ".json") ? chat_json(app)
+                                            : chat_markdown(app);
+    if (write_text(f, body, &why)) {
+        set_status(app, "chat saved: %s", base);
+    } else {
+        show_error(app, why);
+        g_free(why);
+    }
+    g_free(body);
+    g_free(lower);
+    g_free(base);
+    g_object_unref(f);
+}
+
+static void on_save_chat(GtkButton *b, gpointer data)
+{
+    App *app = data;
+    GtkFileDialog *d;
+    GDateTime *now;
+    char *name;
+    guint i, turns = 0;
+
+    (void)b;
+    sync_system(app);
+    for (i = 0; i < app->history->len; i++)
+        if (g_strcmp0(((Msg *)g_ptr_array_index(app->history, i))->role,
+                      "system"))
+            turns++;
+    if (!turns) {
+        set_status(app, "nothing to save yet");
+        return;
+    }
+    now = g_date_time_new_now_local();
+    name = g_date_time_format(now, "chat-%Y%m%d-%H%M.md");
+    d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, "Save chat (.md = Markdown, .json = full history)");
+    gtk_file_dialog_set_initial_name(d, name);
+    gtk_file_dialog_save(d, app->win, NULL, save_chat_done, app);
+    g_object_unref(d);
+    g_free(name);
+    g_date_time_unref(now);
+}
 
 typedef struct {
-    App  *app;
-    char *url;
-    char *body;
-    char *auth;                /* Authorization header, or NULL */
-    char *model;               /* for the token ledger          */
-    gint64 in_tokens;
-    gint64 out_tokens;
-    gboolean streaming;
-    int   endpoint;
-    GString *acc;      /* assistant text, for the history        */
-    GString *pending;  /* partial NDJSON line                    */
-    gboolean thinking_open;
-    gboolean got_error;
-    long  http_code;
-} Req;
+    App       *app;
+    GPtrArray *blocks;    /* CodeBlock* */
+} CodeJob;
 
-typedef struct {
-    App  *app;
-    char *text;
-} UiText;
-
-typedef struct {
-    App  *app;
-    char *response;
-    char *status;
-    char *model;
-    gint64 in_tokens;
-    gint64 out_tokens;
-} UiDone;
-
-static void ui_text_free(gpointer p)
+static void code_job_free(CodeJob *j)
 {
-    UiText *u = p;
-
-    g_free(u->text);
-    g_free(u);
+    g_ptr_array_unref(j->blocks);
+    g_free(j);
 }
 
-static gboolean ui_append_cb(gpointer p)
+/* scripts with a shebang are made executable */
+static gboolean write_code(GFile *f, const CodeBlock *b, char **why)
 {
-    UiText *u = p;
+    char *path;
 
-    chat_append(u->app, u->text);
-    return G_SOURCE_REMOVE;
+    if (!write_text(f, b->code, why))
+        return FALSE;
+    if (g_str_has_prefix(b->code, "#!") && (path = g_file_get_path(f))) {
+        g_chmod(path, 0755);
+        g_free(path);
+    }
+    return TRUE;
 }
 
-static gboolean ui_status_cb(gpointer p)
+/* name.ext, name-2.ext, name-3.ext, ... : never overwrite in folder mode */
+static GFile *unique_child(GFile *dir, const char *name)
 {
-    UiText *u = p;
+    GFile *f = g_file_get_child(dir, name);
+    const char *dot = strrchr(name, '.');
+    int stem = (dot && dot != name) ? (int)(dot - name) : (int)strlen(name);
+    guint k;
 
-    set_status(u->app, "%s", u->text);
-    return G_SOURCE_REMOVE;
+    for (k = 2; k < 1000 && g_file_query_exists(f, NULL); k++) {
+        char *alt = g_strdup_printf("%.*s-%u%s", stem, name, k, name + stem);
+
+        g_object_unref(f);
+        f = g_file_get_child(dir, alt);
+        g_free(alt);
+    }
+    return f;
 }
 
-/* takes ownership of text */
-static void post_text(App *app, char *text)
+static void save_code_file_done(GObject *src, GAsyncResult *res, gpointer data)
 {
-    UiText *u = g_new0(UiText, 1);
+    CodeJob *job = data;
+    App *app = job->app;
+    GError *err = NULL;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, &err);
+    char *why = NULL, *base;
 
-    u->app = app;
-    u->text = text;
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_append_cb, u, ui_text_free);
+    if (dialog_aborted(app, err) || !f) {
+        if (f)
+            g_object_unref(f);
+        code_job_free(job);
+        return;
+    }
+    base = g_file_get_basename(f);
+    if (write_code(f, g_ptr_array_index(job->blocks, 0), &why)) {
+        set_status(app, "code saved: %s", base);
+    } else {
+        show_error(app, why);
+        g_free(why);
+    }
+    g_free(base);
+    g_object_unref(f);
+    code_job_free(job);
 }
 
-static void post_status(App *app, char *text)
+static void save_code_dir_done(GObject *src, GAsyncResult *res, gpointer data)
 {
-    UiText *u = g_new0(UiText, 1);
+    CodeJob *job = data;
+    App *app = job->app;
+    GError *err = NULL;
+    GFile *dir = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src),
+                                                      res, &err);
+    GString *bad;
+    char *dname;
+    guint i, ok = 0;
 
-    u->app = app;
-    u->text = text;
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_status_cb, u, ui_text_free);
+    if (dialog_aborted(app, err) || !dir) {
+        if (dir)
+            g_object_unref(dir);
+        code_job_free(job);
+        return;
+    }
+    bad = g_string_new(NULL);
+    for (i = 0; i < job->blocks->len; i++) {
+        CodeBlock *b = g_ptr_array_index(job->blocks, i);
+        char *name = code_file_name(b, i, job->blocks->len), *why = NULL;
+        GFile *f = unique_child(dir, name);
+
+        if (write_code(f, b, &why)) {
+            ok++;
+        } else {
+            g_string_append_printf(bad, "%s: %s\n", name, why);
+            g_free(why);
+        }
+        g_object_unref(f);
+        g_free(name);
+    }
+    dname = g_file_get_basename(dir);
+    set_status(app, "%u of %u code files saved in %s",
+               ok, job->blocks->len, dname);
+    if (bad->len)
+        show_error(app, bad->str);
+    g_free(dname);
+    g_string_free(bad, TRUE);
+    g_object_unref(dir);
+    code_job_free(job);
 }
 
-/*
- * Thinking regions are opened and closed from the worker thread but the
- * marks and header text must be created on the main loop, in order with
- * the surrounding text pieces. These control events ride the same idle
- * queue as post_text(), so they interleave correctly with the stream.
- */
-typedef enum {
-    UI_THINK_BEGIN,
-    UI_THINK_END
-} UiEventType;
-
-typedef struct {
-    App        *app;
-    UiEventType type;
-} UiEvent;
-
-static gboolean ui_event_cb(gpointer p)
+static void on_save_code(GtkButton *b, gpointer data)
 {
-    UiEvent *ev = p;
-    App *app = ev->app;
-    GtkTextIter end;
+    App *app = data;
+    GPtrArray *blocks = last_code_blocks(app);
+    GtkFileDialog *d;
+    CodeJob *job;
 
-    if (ev->type == UI_THINK_BEGIN) {
-        ThinkBlock *blk = g_new0(ThinkBlock, 1);
+    (void)b;
+    if (!blocks) {
+        set_status(app, "no code blocks in the replies");
+        gtk_widget_set_sensitive(app->code_btn, FALSE);
+        return;
+    }
+    job = g_new0(CodeJob, 1);
+    job->app = app;
+    job->blocks = blocks;
+    d = gtk_file_dialog_new();
+    if (blocks->len == 1) {
+        char *name = code_file_name(g_ptr_array_index(blocks, 0), 0, 1);
 
-        ensure_tags(app);
-        blk->expanded = TRUE;               /* visible while it streams */
-        blk->body_tag = g_strdup_printf("tbody%u", app->think_seq++);
-        gtk_text_buffer_create_tag(app->chat_buf, blk->body_tag,
-            "invisible", FALSE,
-            "style", PANGO_STYLE_ITALIC,
-            "foreground", "#8b949e", NULL);
+        gtk_file_dialog_set_title(d, "Save code");
+        gtk_file_dialog_set_initial_name(d, name);
+        gtk_file_dialog_save(d, app->win, NULL, save_code_file_done, job);
+        g_free(name);
+    } else {
+        char *title = g_strdup_printf("Folder for %u code files", blocks->len);
 
-        gtk_text_buffer_get_end_iter(app->chat_buf, &end);
-        blk->head_start =
-            gtk_text_buffer_create_mark(app->chat_buf, NULL, &end, TRUE);
-        gtk_text_buffer_insert(app->chat_buf, &end,
-                               "\xE2\x96\xBE thinking\n", -1);  /* ▾ header */
-        gtk_text_buffer_get_end_iter(app->chat_buf, &end);
-        blk->body_start =
-            gtk_text_buffer_create_mark(app->chat_buf, NULL, &end, TRUE);
+        gtk_file_dialog_set_title(d, title);
+        gtk_file_dialog_select_folder(d, app->win, NULL,
+                                      save_code_dir_done, job);
+        g_free(title);
+    }
+    g_object_unref(d);
+}
 
-        g_ptr_array_add(app->think_blocks, blk);
-        app->think_current = blk;
-    } else {                                /* UI_THINK_END */
-        ThinkBlock *blk = app->think_current;
+/* ================================================================== */
+/*  worker thread: streaming / non-streaming request                  */
+/* ================================================================== */
 
-        if (blk) {
-            gtk_text_buffer_get_end_iter(app->chat_buf, &end);
-            blk->body_end =
-                gtk_text_buffer_create_mark(app->chat_buf, NULL, &end, TRUE);
-            gtk_text_buffer_insert(app->chat_buf, &end, "\n", -1);
-            blk->expanded = FALSE;          /* collapse once thinking ends */
-            think_set_arrow(app, blk);
-            think_apply_one(app, blk);
-            app->think_current = NULL;
+static void worker_unref(Worker *wd)
+{
+    if (!g_atomic_int_dec_and_test(&wd->refs))
+        return;
+    prov_parser_free(wd->parser);
+    prov_request_free(wd->req);
+    g_string_free(wd->pending, TRUE);
+    g_string_free(wd->full, TRUE);
+    g_string_free(wd->line_txt, TRUE);
+    g_string_free(wd->line_thk, TRUE);
+    g_string_free(wd->q_text, TRUE);
+    g_string_free(wd->q_think, TRUE);
+    g_mutex_clear(&wd->q_lock);
+    g_free(wd->error);
+    g_free(wd->qkey);
+    g_free(wd);
+}
+
+static Worker *worker_new(App *app, ProvRequest *req, ProvId prov,
+                          gboolean stream)
+{
+    Worker *wd = g_new0(Worker, 1);
+
+    wd->app = app;
+    wd->req = req;
+    wd->prov = prov;
+    wd->stream = stream;
+    wd->refs = 1;                          /* dropped by worker_done_idle */
+    wd->parser = prov_parser_new(prov);
+    wd->pending = g_string_new(NULL);
+    wd->full = g_string_new(NULL);
+    wd->line_txt = g_string_new(NULL);
+    wd->line_thk = g_string_new(NULL);
+    wd->q_text = g_string_new(NULL);
+    wd->q_think = g_string_new(NULL);
+    g_mutex_init(&wd->q_lock);
+    return wd;
+}
+
+/* main thread: render everything queued since the last flush */
+static void worker_drain(Worker *wd)
+{
+    App *app = wd->app;
+    char *think = NULL, *text = NULL;
+
+    g_mutex_lock(&wd->q_lock);
+    if (wd->q_think->len) {
+        think = g_strndup(wd->q_think->str, wd->q_think->len);
+        g_string_truncate(wd->q_think, 0);
+    }
+    if (wd->q_text->len) {
+        text = g_strndup(wd->q_text->str, wd->q_text->len);
+        g_string_truncate(wd->q_text, 0);
+    }
+    wd->q_scheduled = FALSE;
+    g_mutex_unlock(&wd->q_lock);
+
+    if ((think || text) && !app->closing) {
+        if (!app->cur_box)
+            asst_begin(app);
+        if (think) {
+            if (!app->cur_think_buf)
+                asst_think(app);
+            buf_append(app->cur_think_buf, think);
+        }
+        if (text) {
+            if (!app->cur_text_buf)
+                asst_text(app);
+            buf_append(app->cur_text_buf, text);
+            g_string_append(app->reply_acc, text);
         }
     }
+    g_free(think);
+    g_free(text);
+}
+
+static gboolean flush_idle(gpointer data)
+{
+    Worker *wd = data;
+
+    worker_drain(wd);
+    worker_unref(wd);
     return G_SOURCE_REMOVE;
 }
 
-static void post_event(App *app, UiEventType t)
+/* worker thread: queue a delta; at most one flush idle is ever pending */
+static void push_delta(Worker *wd, const GString *think, const GString *text)
 {
-    UiEvent *ev = g_new0(UiEvent, 1);
+    gboolean schedule;
 
-    ev->app = app;
-    ev->type = t;
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_event_cb, ev, g_free);
+    g_mutex_lock(&wd->q_lock);
+    if (think && think->len)
+        g_string_append_len(wd->q_think, think->str, (gssize)think->len);
+    if (text && text->len)
+        g_string_append_len(wd->q_text, text->str, (gssize)text->len);
+    schedule = !wd->q_scheduled;
+    wd->q_scheduled = TRUE;
+    g_mutex_unlock(&wd->q_lock);
+    if (schedule) {
+        g_atomic_int_inc(&wd->refs);
+        g_idle_add(flush_idle, wd);
+    }
 }
 
-static void ui_done_free(gpointer p)
+static void start_request(App *app, guint retries);
+
+static gboolean worker_done_idle(gpointer data)
 {
-    UiDone *d = p;
+    Worker *wd = data;
+    App *app = wd->app;
 
-    g_free(d->response);
-    g_free(d->status);
-    g_free(d->model);
-    g_free(d);
-}
-
-static gboolean ui_done_cb(gpointer p)
-{
-    UiDone *d = p;
-    App *app = d->app;
-
-    if (d->response && *d->response) {
-        JsonBuilder *b = json_builder_new();
-
-        g_free(app->last_response);
-        app->last_response = g_strdup(d->response);
-
-        json_builder_begin_object(b);
-        json_builder_set_member_name(b, "role");
-        json_builder_add_string_value(b, "assistant");
-        json_builder_set_member_name(b, "content");
-        json_builder_add_string_value(b, d->response);
-        json_builder_end_object(b);
-        json_array_add_element(app->messages, json_builder_get_root(b));
-        g_object_unref(b);
-    }
-
-    /* fold this exchange into the ledger and persist it */
-    if (d->in_tokens > 0 || d->out_tokens > 0) {
-        usage_record(app, d->model, d->in_tokens, d->out_tokens);
-        save_state(app);
-    }
-
-    chat_append(app, "\n");
-    set_status(app, "%s", d->status ? d->status : "Done");
-
+    worker_drain(wd);                      /* whatever is still queued */
+    if (app->worker == wd)
+        app->worker = NULL;
     app->busy = FALSE;
+    if (app->closing) {
+        worker_unref(wd);
+        return G_SOURCE_REMOVE;
+    }
+
+    /* the API refused a parameter: remember that for this model and
+     * resend the same turn without it (each pass must learn something) */
+    if (wd->error && !wd->cancelled && !app->cur_box && !app->reply_acc->len &&
+        (wd->http_code == 400 || wd->http_code == 422) && wd->retries < 4 &&
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->adapt_cb))) {
+        guint add = classify_rejection(wd->prov, wd->error, wd->req->sent,
+                                       wd->quirks);
+
+        if (add) {
+            char *names = quirk_names(add);
+            char *note = g_strdup_printf("⟳ adapting request (%s): %.160s",
+                                         names, wd->error);
+
+            chat_note(app, note, FALSE);
+            quirks_learn(app, wd->qkey, add);
+            g_free(note);
+            g_free(names);
+            start_request(app, wd->retries + 1);
+            worker_unref(wd);
+            return G_SOURCE_REMOVE;
+        }
+    }
+
     gtk_spinner_stop(GTK_SPINNER(app->spinner));
     gtk_widget_set_sensitive(app->send_btn, TRUE);
     gtk_widget_set_sensitive(app->stop_btn, FALSE);
 
-    finish_render(app);                 /* decorate the reply */
+    if (app->reply_acc->len) {
+        g_ptr_array_add(app->history, msg_new("assistant", app->reply_acc->str));
+        if (!gtk_widget_get_sensitive(app->code_btn)) {
+            GPtrArray *cb = extract_code(app->reply_acc->str);
+
+            gtk_widget_set_sensitive(app->code_btn, cb->len > 0);
+            g_ptr_array_unref(cb);
+        }
+        app->requests++;
+        if (wd->in_tok > 0)
+            app->total_in += wd->in_tok;
+        if (wd->out_tok > 0)
+            app->total_out += wd->out_tok;
+    } else {
+        if (app->history->len &&
+            !g_strcmp0(((Msg *)g_ptr_array_index(app->history,
+                             app->history->len - 1))->role, "user"))
+            g_ptr_array_remove_index(app->history, app->history->len - 1);
+    }
+
+    if (app->cur_text_buf)
+        buf_rstrip(app->cur_text_buf);
+    if (app->cur_think_buf)
+        buf_rstrip(app->cur_think_buf);
+    app->cur_box = NULL;
+    app->cur_think_buf = app->cur_text_buf = NULL;
+
+    if (wd->error) {
+        char *note = g_strdup_printf(app->reply_acc->len
+                         ? "✕ %s"
+                         : "✕ %s — this turn was not kept in the history",
+                         wd->error);
+
+        chat_note(app, note, TRUE);
+        g_free(note);
+        set_status(app, "failed: %.100s", wd->error);
+    } else if (wd->cancelled) {
+        chat_note(app, "stopped", FALSE);
+        set_status(app, "stopped");
+    } else if (app->reply_acc->len) {
+        set_status(app,
+            "done · in %lld / out %lld tok · totals %lld/%lld · replies %lld",
+            (long long)wd->in_tok, (long long)wd->out_tok,
+            (long long)app->total_in, (long long)app->total_out,
+            (long long)app->requests);
+    } else {
+        set_status(app, "empty reply");
+    }
+    worker_unref(wd);
     return G_SOURCE_REMOVE;
 }
 
-/* one complete NDJSON object (also used whole for non-streaming bodies) */
-static void process_chunk_line(Req *r, const char *line)
+static void worker_feed_line(Worker *wd, const char *line)
 {
-    JsonParser *p;
-    JsonNode *root;
-    JsonObject *o;
-    const char *errm, *piece = NULL, *think = NULL;
-
-    while (*line == ' ' || *line == '\t' || *line == '\r')
-        line++;
-    if (!*line)
-        return;
-
-    p = json_parser_new();
-    if (!json_parser_load_from_data(p, line, -1, NULL)) {
-        g_object_unref(p);
-        return;
+    g_string_truncate(wd->line_txt, 0);
+    g_string_truncate(wd->line_thk, 0);
+    if (!prov_parser_feed(wd->parser, line, wd->line_txt, wd->line_thk)) {
+        g_free(wd->error);
+        wd->error = g_strdup(prov_parser_error(wd->parser));
+    } else if (wd->line_txt->len || wd->line_thk->len) {
+        push_delta(wd, wd->line_thk, wd->line_txt);
     }
-    root = json_parser_get_root(p);
-    if (!JSON_NODE_HOLDS_OBJECT(root)) {
-        g_object_unref(p);
-        return;
-    }
-    o = json_node_get_object(root);
-
-    errm = obj_str(o, "error");
-    if (errm) {
-        r->got_error = TRUE;
-        post_text(r->app, g_strdup_printf("\n[Error] %s\n", errm));
-        g_object_unref(p);
-        return;
-    }
-
-    if (r->endpoint == 0) {             /* /api/chat */
-        if (json_object_has_member(o, "message")) {
-            JsonNode *mn = json_object_get_member(o, "message");
-
-            if (JSON_NODE_HOLDS_OBJECT(mn)) {
-                JsonObject *m = json_node_get_object(mn);
-
-                piece = obj_str(m, "content");
-                think = obj_str(m, "thinking");
-            }
-        }
-    } else {                            /* /api/generate */
-        piece = obj_str(o, "response");
-        think = obj_str(o, "thinking");
-    }
-
-    if (think && *think) {
-        if (!r->thinking_open) {
-            post_event(r->app, UI_THINK_BEGIN);
-            r->thinking_open = TRUE;
-        }
-        post_text(r->app, g_strdup(think));
-    }
-    if (piece && *piece) {
-        if (r->thinking_open) {
-            post_event(r->app, UI_THINK_END);
-            r->thinking_open = FALSE;
-        }
-        g_string_append(r->acc, piece);
-        post_text(r->app, g_strdup(piece));
-    }
-
-    if (obj_true(o, "done")) {
-        gint64 total = obj_int(o, "total_duration", 0);
-        gint64 evals = obj_int(o, "eval_count", 0);
-        gint64 prompt = obj_int(o, "prompt_eval_count", 0);
-
-        if (prompt > 0)
-            r->in_tokens = prompt;
-        if (evals > 0)
-            r->out_tokens = evals;
-        if (evals > 0)
-            post_status(r->app,
-                        g_strdup_printf("generated %" G_GINT64_FORMAT
-                                        " tokens in %.1f s",
-                                        evals, (double)total / 1e9));
-    }
-    g_object_unref(p);
 }
 
-static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+static size_t worker_write(char *ptr, size_t size, size_t nmemb, void *ud)
 {
-    Req *r = userdata;
-    size_t n = size * nmemb, consumed = 0;
-    char *buf, *nl;
+    Worker *wd = ud;
+    gsize total = size * nmemb, start = 0;
+    char *nl;
 
-    if (g_atomic_int_get(&r->app->cancel))
-        return 0;                       /* abort the transfer */
-
-    g_string_append_len(r->pending, ptr, (gssize)n);
-
-    if (!r->streaming)
-        return n;                       /* parse the whole body at the end */
-
-    buf = r->pending->str;
-    while ((nl = memchr(buf + consumed, '\n', r->pending->len - consumed))) {
-        size_t off = (size_t)(nl - buf);
-        char *line = g_strndup(buf + consumed, off - consumed);
-
-        process_chunk_line(r, line);
-        g_free(line);
-        consumed = off + 1;
+    if (g_atomic_int_get(&wd->cancel)) {
+        wd->cancelled = TRUE;
+        return 0;                          /* abort the transfer */
     }
-    if (consumed)
-        g_string_erase(r->pending, 0, (gssize)consumed);
-    return n;
+    if (!wd->stream) {                     /* parsed as a whole at the end */
+        g_string_append_len(wd->full, ptr, (gssize)total);
+        return total;
+    }
+    if (wd->full->len < ERR_BODY_CAP)      /* bounded copy for error reports */
+        g_string_append_len(wd->full, ptr,
+                            (gssize)MIN(total, ERR_BODY_CAP - wd->full->len));
+
+    /* split complete lines in place; shift the buffer once per chunk */
+    g_string_append_len(wd->pending, ptr, (gssize)total);
+    while (!wd->error &&
+           (nl = memchr(wd->pending->str + start, '\n',
+                        wd->pending->len - start)) != NULL) {
+        gsize len = (gsize)(nl - (wd->pending->str + start));
+
+        *nl = '\0';
+        if (len && nl[-1] == '\r')
+            nl[-1] = '\0';
+        worker_feed_line(wd, wd->pending->str + start);
+        start += len + 1;
+    }
+    if (start)
+        g_string_erase(wd->pending, 0, (gssize)start);
+    return wd->error ? 0 : total;          /* surface the error, stop reading */
 }
 
-static void req_free(Req *r)
+/* lets Stop abort promptly even while no bytes are arriving */
+static int worker_progress(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                           curl_off_t ultotal, curl_off_t ulnow)
 {
-    g_free(r->url);
-    g_free(r->body);
-    g_free(r->auth);
-    g_free(r->model);
-    if (r->acc)
-        g_string_free(r->acc, TRUE);
-    if (r->pending)
-        g_string_free(r->pending, TRUE);
-    g_free(r);
+    Worker *wd = ud;
+
+    (void)dltotal;
+    (void)dlnow;
+    (void)ultotal;
+    (void)ulnow;
+    if (g_atomic_int_get(&wd->cancel)) {
+        wd->cancelled = TRUE;
+        return 1;                          /* CURLE_ABORTED_BY_CALLBACK */
+    }
+    return 0;
 }
 
-static gpointer req_worker(gpointer data)
+static gpointer worker_thread(gpointer data)
 {
-    Req *r = data;
-    CURL *curl;
-    CURLcode cc;
-    struct curl_slist *hdrs = NULL;
+    Worker *wd = data;
+    struct curl_slist *hl = NULL;
+    CURL *c;
+    CURLcode rc;
     long code = 0;
-    double total = 0.0;
-    UiDone *d;
-    gboolean cancelled;
+    char **h;
 
-    curl = curl_easy_init();
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    if (r->auth)
-        hdrs = curl_slist_append(hdrs, r->auth);
-    curl_easy_setopt(curl, CURLOPT_URL, r->url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, r->body);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(r->body));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, r);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-
-    cc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total);
-    r->http_code = code;
-    cancelled = g_atomic_int_get(&r->app->cancel) != 0;
-
-    /* flush a trailing line that never saw '\n' */
-    if (cc == CURLE_OK && r->streaming && r->pending->len > 0) {
-        char *line = g_strndup(r->pending->str, r->pending->len);
-
-        g_string_truncate(r->pending, 0);
-        process_chunk_line(r, line);
-        g_free(line);
+    c = curl_easy_init();
+    if (!c) {
+        wd->error = g_strdup("libcurl initialisation failed");
+        goto finish;
     }
-    /* non-streaming: the whole response body is one JSON object */
-    if (cc == CURLE_OK && !r->streaming && r->pending->len > 0)
-        process_chunk_line(r, r->pending->str);
+    for (h = wd->req->headers; h && *h; h++)
+        hl = curl_slist_append(hl, *h);
+    curl_easy_setopt(c, CURLOPT_URL, wd->req->url);
+    if (hl)
+        curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, wd->req->body);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(wd->req->body));
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, worker_write);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, wd);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, worker_progress);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA, wd);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "ollama-gui/1.0");
+    rc = curl_easy_perform(c);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    wd->http_code = code;
+    curl_slist_free_all(hl);
+    curl_easy_cleanup(c);
 
-    /* a reply that was pure thinking never saw a content piece — close it */
-    if (r->thinking_open) {
-        post_event(r->app, UI_THINK_END);
-        r->thinking_open = FALSE;
+    /* a final stream line without a trailing newline */
+    if (wd->stream && rc == CURLE_OK && code < 400 && !wd->error &&
+        wd->pending->len)
+        worker_feed_line(wd, wd->pending->str);
+
+    if (!wd->error && !wd->cancelled) {
+        if (rc != CURLE_OK) {
+            wd->error = g_strdup_printf("network error: %s",
+                                        curl_easy_strerror(rc));
+        } else if (code >= 400) {
+            wd->error = body_error(wd->full->str, wd->full->len);
+            if (!wd->error)
+                wd->error = wd->full->len
+                    ? g_strdup_printf("HTTP %ld: %.300s", code, wd->full->str)
+                    : g_strdup_printf("HTTP %ld (empty body)", code);
+        } else if (!wd->stream) {
+            GString *txt = g_string_new(NULL);
+            GString *thk = g_string_new(NULL);
+            char *err = NULL;
+
+            if (prov_parse_body(wd->prov, wd->full->str, wd->full->len,
+                                txt, thk, &wd->in_tok, &wd->out_tok, &err))
+                push_delta(wd, thk, txt);
+            else
+                wd->error = err;
+            g_string_free(txt, TRUE);
+            g_string_free(thk, TRUE);
+        } else {
+            prov_parser_usage(wd->parser, &wd->in_tok, &wd->out_tok);
+        }
     }
-
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-
-    if (cc != CURLE_OK && !cancelled)
-        post_text(r->app, g_strdup_printf("\n[Error] %s\n",
-                                          curl_easy_strerror(cc)));
-
-    d = g_new0(UiDone, 1);
-    d->app = r->app;
-    d->model = g_strdup(r->model ? r->model : "");
-    d->in_tokens = r->in_tokens;
-    d->out_tokens = r->out_tokens;
-    if (r->acc->len)
-        d->response = g_strdup(r->acc->str);
-    if (cancelled)
-        d->status = g_strdup("Stopped by user");
-    else if (cc == CURLE_OK && r->got_error)
-        d->status = g_strdup_printf("HTTP %ld — server reported an error", code);
-    else if (cc == CURLE_OK)
-        d->status = g_strdup_printf("HTTP %ld · %.1f s · %" G_GSIZE_FORMAT
-                                    " chars", code, total, r->acc->len);
-    else
-        d->status = g_strdup_printf("Request failed: %s",
-                                    curl_easy_strerror(cc));
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_done_cb, d, ui_done_free);
-
-    req_free(r);
+finish:
+    g_idle_add(worker_done_idle, wd);
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* model list (/api/tags)                                              */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  model-list loading                                                */
+/* ================================================================== */
 
 typedef struct {
-    App       *app;
-    char      *url;     /* built on the main thread */
-    GPtrArray *names;   /* char*                    */
-    char      *error;
-} ModelsResult;
+    App    *app;
+    ProvId  id;
+    char   *url;
+    char  **headers;
+    char   *err;
+    char  **names;
+} ModelsJob;
 
-static void models_result_free(gpointer p)
+static size_t models_write_cb(char *ptr, size_t s, size_t n, void *ud)
 {
-    ModelsResult *r = p;
-
-    if (r->names)
-        g_ptr_array_free(r->names, TRUE);
-    g_free(r->url);
-    g_free(r->error);
-    g_free(r);
+    g_string_append_len((GString *)ud, ptr, s * n);
+    return s * n;
 }
 
-static size_t get_write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
+static gboolean models_done_idle(gpointer data)
 {
-    GString *s = ud;
+    ModelsJob *j = data;
+    App *app = j->app;
 
-    g_string_append_len(s, ptr, (gssize)(size * nmemb));
-    return size * nmemb;
-}
+    if (app->closing) {
+        /* window already destroyed: just free the job */
+    } else if (j->err) {
+        show_error(app, j->err);
+        set_status(app, "model list failed (%s)", prov_get(j->id)->label);
+    } else if (j->names && *j->names) {
+        guint cnt = g_list_model_get_n_items(G_LIST_MODEL(app->model_list));
+        char **n;
 
-static gboolean ui_models_cb(gpointer p);
-
-static gpointer models_worker(gpointer data)
-{
-    ModelsResult *r = data;
-    CURL *curl = curl_easy_init();
-    GString *body = g_string_new(NULL);
-    CURLcode cc;
-    long code = 0;
-
-    curl_easy_setopt(curl, CURLOPT_URL, r->url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, get_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    cc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    curl_easy_cleanup(curl);
-
-    if (cc != CURLE_OK) {
-        r->error = g_strdup(curl_easy_strerror(cc));
-    } else if (code != 200) {
-        r->error = g_strdup_printf("HTTP %ld", code);
-    } else {
-        JsonParser *p = json_parser_new();
-
-        if (json_parser_load_from_data(p, body->str, (gssize)body->len, NULL)) {
-            JsonNode *rootn = json_parser_get_root(p);
-
-            if (JSON_NODE_HOLDS_OBJECT(rootn)) {
-                JsonObject *root = json_node_get_object(rootn);
-
-                if (json_object_has_member(root, "models")) {
-                    JsonNode *mn = json_object_get_member(root, "models");
-
-                    if (JSON_NODE_HOLDS_ARRAY(mn)) {
-                        JsonArray *arr = json_node_get_array(mn);
-                        guint i, n = json_array_get_length(arr);
-
-                        for (i = 0; i < n; i++) {
-                            JsonNode *el = json_array_get_element(arr, i);
-
-                            if (JSON_NODE_HOLDS_OBJECT(el)) {
-                                const char *name =
-                                    obj_str(json_node_get_object(el), "name");
-
-                                if (name)
-                                    g_ptr_array_add(r->names, g_strdup(name));
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            r->error = g_strdup("Invalid JSON from /api/tags");
+        g_ptr_array_set_size(app->models, 0);
+        if (cnt)
+            gtk_string_list_splice(app->model_list, 0, cnt, NULL);
+        for (n = j->names; *n; n++) {
+            g_ptr_array_add(app->models, g_strdup(*n));
+            gtk_string_list_append(app->model_list, *n);
         }
-        g_object_unref(p);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd), 0);
+        set_status(app, "%u models loaded (%s)",
+                   app->models->len, prov_get(j->id)->label);
+    } else {
+        set_status(app, "no models returned");
     }
-    g_string_free(body, TRUE);
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_models_cb, r,
-                    models_result_free);
-    return NULL;
-}
-
-static gboolean ui_models_cb(gpointer p)
-{
-    ModelsResult *r = p;
-    App *app = r->app;
-    guint i, n_old;
-    const char **items;
-
-    if (!r->names || r->names->len == 0) {
-        set_status(app, "No models: %s",
-                   r->error ? r->error : "empty /api/tags response");
-        return G_SOURCE_REMOVE;
-    }
-
-    g_ptr_array_set_size(app->models, 0);       /* free old entries */
-    items = g_new0(const char *, r->names->len + 1);
-    for (i = 0; i < r->names->len; i++) {
-        g_ptr_array_add(app->models,
-                        g_strdup(g_ptr_array_index(r->names, i)));
-        items[i] = g_ptr_array_index(app->models, i);
-    }
-    n_old = g_list_model_get_n_items(G_LIST_MODEL(app->model_list));
-    gtk_string_list_splice(app->model_list, 0, n_old, items);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd), 0);
-    set_status(app, "%u model%s loaded",
-               r->names->len, r->names->len == 1 ? "" : "s");
-    g_free(items);
+    g_strfreev(j->names);
+    g_strfreev(j->headers);
+    g_free(j->url);
+    g_free(j->err);
+    g_free(j);
     return G_SOURCE_REMOVE;
 }
 
-static void start_models_load(App *app)
+static gpointer models_thread(gpointer data)
 {
-    ModelsResult *r = g_new0(ModelsResult, 1);
-    char *base = base_url(app);
+    ModelsJob *j = data;
+    GString *body = g_string_new(NULL);
+    CURL *c = curl_easy_init();
+    struct curl_slist *h = NULL;
+    char **hh;
+    long code = 0;
+    CURLcode rc;
 
-    r->app = app;
-    r->url = g_strdup_printf("%s/api/tags", base);
-    r->names = g_ptr_array_new_with_free_func(g_free);
-    g_free(base);
-    set_status(app, "Loading models…");
-    g_thread_unref(g_thread_new("ollama-tags", models_worker, r));
+    if (!c) {
+        j->err = g_strdup("curl init failed");
+        goto out;
+    }
+    for (hh = j->headers; hh && *hh; hh++)
+        h = curl_slist_append(h, *hh);
+    curl_easy_setopt(c, CURLOPT_URL, j->url);
+    if (h)
+        curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, models_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    rc = curl_easy_perform(c);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (rc != CURLE_OK)
+        j->err = g_strdup_printf("network error: %s", curl_easy_strerror(rc));
+    else if (code == 200)
+        j->names = prov_parse_models(j->id, body->str, body->len);
+    else if (!(j->err = body_error(body->str, body->len)))
+        j->err = g_strdup_printf("HTTP %ld: %.200s", code, body->str);
+    curl_slist_free_all(h);
+    curl_easy_cleanup(c);
+out:
+    g_string_free(body, TRUE);
+    g_idle_add(models_done_idle, j);
+    return NULL;
 }
 
-static void on_refresh_models(GtkButton *b, gpointer data)
+/* ================================================================== */
+/*  signal handlers                                                   */
+/* ================================================================== */
+
+static void on_load_models(GtkButton *b, gpointer data)
 {
+    App *app = data;
+    ProvListReq *r = prov_list_models(app->prov_id,
+            gtk_editable_get_text(GTK_EDITABLE(app->host_e)),
+            gtk_editable_get_text(GTK_EDITABLE(app->key_e)));
+    ModelsJob *j = g_new0(ModelsJob, 1);
+
     (void)b;
-    start_models_load(data);
+    j->app = app;
+    j->id = app->prov_id;
+    j->url = g_strdup(r->url);
+    j->headers = r->headers ? g_strdupv(r->headers) : NULL;
+    prov_list_req_free(r);
+    set_status(app, "loading model list…");
+    g_thread_unref(g_thread_new("prov-models", models_thread, j));
 }
 
-/* ------------------------------------------------------------------ */
-/* actions                                                             */
-/* ------------------------------------------------------------------ */
-
-static void send_request(App *app)
+static void on_preview(GtkButton *b, gpointer data)
 {
-    GError *err = NULL;
-    JsonNode *payload, *umsg = NULL;
-    int ep;
-    char *body, *url, *base, *ts, *hdr, *input, *trimmed;
-    const char *model;
-    Req *r;
+    App *app = data;
+    char *input = buffer_text(app->input_buf);
+    GPtrArray *hist = g_ptr_array_new_with_free_func(msg_free);
+    ProvRequest *r;
+    GString *s = g_string_new(NULL);
+    char **h;
+    guint i;
 
-    if (app->busy)
-        return;
-    model = selected_model(app);
-    if (!model || !*model) {
-        show_error(app, "No model selected — press the refresh button to load the model list.");
-        return;
+    (void)b;
+    sync_system(app);
+    for (i = 0; i < app->history->len; i++)
+        g_ptr_array_add(hist, preview_copy(g_ptr_array_index(app->history, i)));
+    if ((input && *input) || app->att->len) {
+        Msg *next = compose_user_msg(app->att, input);
+
+        g_ptr_array_add(hist, preview_copy(next));
+        msg_free(next);
     }
+    {
+        const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+        GenParams gp;
 
-    input = buffer_text(app->input_buf);
-    trimmed = g_strstrip(input);
-    if (!*trimmed && app->attachments->len == 0) {
-        set_status(app, "Type a message or attach a file first");
-        g_free(input);
-        return;
+        gen_params(app, model, &gp);
+        r = prov_build_request(app->prov_id,
+                gtk_editable_get_text(GTK_EDITABLE(app->host_e)), model,
+                gtk_editable_get_text(GTK_EDITABLE(app->key_e)),
+                gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb)),
+                &gp, hist);
     }
+    g_ptr_array_unref(hist);
 
-    payload = build_payload(app, trimmed, &ep, &umsg, &err);
-    if (!payload) {
-        show_error(app, err ? err->message : "Cannot build request");
-        g_clear_error(&err);
-        g_free(input);
-        return;
+    g_string_append_printf(s, "POST %s\n", r->url);
+    for (h = r->headers; h && *h; h++) {          /* mask secrets */
+        const char *colon = strchr(*h, ':');
+
+        if (colon && (g_ascii_strncasecmp(*h, "Authorization:", 14) == 0 ||
+                      strstr(*h, "api-key")))
+            g_string_append_printf(s, "%.*s: ***\n", (int)(colon - *h), *h);
+        else
+            g_string_append_printf(s, "%s\n", *h);
     }
+    g_string_append_c(s, '\n');
+    {
+        JsonParser *p = json_parser_new();
 
-    body = node_to_string(payload, FALSE);
-    g_free(app->last_payload);
-    app->last_payload = g_strdup(body);
-
-    /* echo the request into the transcript */
-    ts = timestamp();
-    hdr = g_strdup_printf("\n[You · %s]\n", ts);
-    chat_append(app, hdr);
-    g_free(hdr);
-    g_free(ts);
-    if (*trimmed) {
-        chat_append(app, trimmed);
-        chat_append(app, "\n");
+        if (json_parser_load_from_data(p, r->body, -1, NULL)) {
+            char *pretty = node_to_string(json_parser_get_root(p), TRUE);
+            g_string_append(s, pretty);
+            g_free(pretty);
+        } else {
+            g_string_append(s, r->body);
+        }
+        g_object_unref(p);
     }
-    if (app->attachments->len > 0) {
-        hdr = g_strdup_printf("[%u attachment%s included]\n",
-                              app->attachments->len,
-                              app->attachments->len == 1 ? "" : "s");
-        chat_append(app, hdr);
-        g_free(hdr);
-    }
-    chat_append(app, "\n[Assistant]\n");
-    finish_render(app);                 /* align the question right away */
+    show_text_window(app, "Request preview", s->str);
+    g_string_free(s, TRUE);
+    g_free(input);
+    prov_request_free(r);
+}
 
-    base = base_url(app);
-    url = g_strdup_printf("%s%s", base, ENDPOINTS[ep]);
-    g_free(base);
+/* build the request from the current history and settings, and run it */
+static void start_request(App *app, guint retries)
+{
+    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+    gboolean stream = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb));
+    GenParams gp;
+    ProvRequest *req;
+    Worker *wd;
 
-    r = g_new0(Req, 1);
-    r->app = app;
-    r->url = url;
-    r->body = body;                             /* ownership transferred */
-    r->auth = auth_header(app);
-    r->model = g_strdup(model);
-    r->streaming = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb));
-    r->endpoint = ep;
-    r->acc = g_string_new(NULL);
-    r->pending = g_string_new(NULL);
+    gen_params(app, model, &gp);
+    req = prov_build_request(app->prov_id,
+            gtk_editable_get_text(GTK_EDITABLE(app->host_e)),
+            model, app->keys[app->prov_id], stream, &gp, app->history);
 
-    /* history: the payload was built with the old history; add ours now */
-    json_array_add_element(app->messages, umsg);
-    json_node_free(payload);
-
+    wd = worker_new(app, req, app->prov_id, stream);
+    wd->qkey = quirk_key(app->prov_id, model);
+    wd->quirks = gp.quirks;
+    wd->retries = retries;
+    app->worker = wd;
     app->busy = TRUE;
-    g_atomic_int_set(&app->cancel, 0);
+    app->cur_box = NULL;
+    app->cur_think_buf = app->cur_text_buf = NULL;
+    g_string_truncate(app->reply_acc, 0);
+
+    gtk_spinner_start(GTK_SPINNER(app->spinner));
     gtk_widget_set_sensitive(app->send_btn, FALSE);
     gtk_widget_set_sensitive(app->stop_btn, TRUE);
-    gtk_spinner_start(GTK_SPINNER(app->spinner));
-    set_status(app, "Waiting for %s…", model);
-    gtk_text_buffer_set_text(app->input_buf, "", -1);
-
-    g_thread_unref(g_thread_new("ollama-req", req_worker, r));
+    set_status(app, stream ? "streaming…" : "waiting for reply…");
+    g_thread_unref(g_thread_new("chat", worker_thread, wd));
 }
 
-static void on_send(GtkButton *b, gpointer data)
+static void on_send(GtkButton *btn, gpointer data)
 {
-    (void)b;
-    send_request(data);
+    App *app = data;
+    char *input = buffer_text(app->input_buf);
+    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+
+    (void)btn;
+    if (app->busy || !input || (!*input && app->att->len == 0)) {
+        g_free(input);
+        return;
+    }
+    if (!model || !*model) {
+        show_error(app, "Pick or type a model name first.");
+        g_free(input);
+        return;
+    }
+
+    /* remember host/key for this provider (in-memory, maybe on disk) */
+    g_free(app->hosts[app->prov_id]);
+    app->hosts[app->prov_id] =
+        g_strdup(gtk_editable_get_text(GTK_EDITABLE(app->host_e)));
+    g_free(app->keys[app->prov_id]);
+    app->keys[app->prov_id] =
+        g_strdup(gtk_editable_get_text(GTK_EDITABLE(app->key_e)));
+
+    sync_system(app);
+
+    /* transcript + canonical history */
+    chat_add_user(app, input, app->att);
+    g_ptr_array_add(app->history, compose_user_msg(app->att, input));
+    g_ptr_array_set_size(app->att, 0);     /* attachments go with this turn */
+    att_refresh(app);
+    gtk_text_buffer_set_text(app->input_buf, "", -1);
+    g_free(input);
+
+    config_save(app);
+    start_request(app, 0);
 }
 
 static void on_stop(GtkButton *b, gpointer data)
@@ -2060,236 +3441,23 @@ static void on_stop(GtkButton *b, gpointer data)
     App *app = data;
 
     (void)b;
-    g_atomic_int_set(&app->cancel, 1);
-    set_status(app, "Stopping…");
+    if (app->worker) {
+        g_atomic_int_set(&app->worker->cancel, 1);
+        set_status(app, "stopping…");
+    }
 }
 
-static gboolean on_input_key(GtkEventControllerKey *ctrl, guint keyval,
-                             guint keycode, GdkModifierType state,
-                             gpointer data)
+static gboolean on_input_key(GtkEventControllerKey *c, guint keyval,
+                             guint keycode, GdkModifierType state, gpointer data)
 {
-    (void)ctrl;
+    (void)c;
     (void)keycode;
     if ((state & GDK_CONTROL_MASK) &&
         (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
-        send_request(data);
+        on_send(NULL, data);
         return TRUE;
     }
     return FALSE;
-}
-
-static void on_preview_close(GtkButton *b, gpointer win)
-{
-    (void)b;
-    gtk_window_destroy(GTK_WINDOW(win));
-}
-
-static void on_preview(GtkButton *btn, gpointer data)
-{
-    App *app = data;
-    GError *err = NULL;
-    JsonNode *payload, *umsg = NULL;
-    int ep;
-    char *input, *trimmed, *pretty, *title;
-    GtkWidget *win, *box, *scr, *view, *close_btn;
-    GtkTextBuffer *buf;
-
-    (void)btn;
-    input = buffer_text(app->input_buf);
-    trimmed = g_strstrip(input);
-    payload = build_payload(app, trimmed, &ep, &umsg, &err);
-    g_free(input);
-    if (!payload) {
-        show_error(app, err ? err->message : "Cannot build request");
-        g_clear_error(&err);
-        return;
-    }
-    pretty = node_to_string(payload, TRUE);
-    json_node_free(umsg);               /* preview discards the user node */
-    json_node_free(payload);
-
-    win = gtk_window_new();
-    title = g_strdup_printf("Request preview — POST %s (exact bytes)",
-                            ENDPOINTS[ep]);
-    gtk_window_set_title(GTK_WINDOW(win), title);
-    g_free(title);
-    gtk_window_set_default_size(GTK_WINDOW(win), 680, 560);
-    gtk_window_set_transient_for(GTK_WINDOW(win), app->win);
-    gtk_window_set_modal(GTK_WINDOW(win), TRUE);
-
-    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_margin_start(box, 10);
-    gtk_widget_set_margin_end(box, 10);
-    gtk_widget_set_margin_top(box, 10);
-    gtk_widget_set_margin_bottom(box, 10);
-
-    view = gtk_text_view_new();
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
-    gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_NONE);
-    buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
-    gtk_text_buffer_set_text(buf, pretty, -1);
-    g_free(pretty);
-
-    scr = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scr, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scr), view);
-
-    close_btn = gtk_button_new_with_label("Close");
-    gtk_widget_set_halign(close_btn, GTK_ALIGN_END);
-    g_signal_connect(close_btn, "clicked", G_CALLBACK(on_preview_close), win);
-
-    gtk_box_append(GTK_BOX(box), scr);
-    gtk_box_append(GTK_BOX(box), close_btn);
-    gtk_window_set_child(GTK_WINDOW(win), box);
-    gtk_window_present(GTK_WINDOW(win));
-}
-
-static void on_copy_reply(GtkButton *b, gpointer data)
-{
-    App *app = data;
-
-    (void)b;
-    if (!app->last_response || !*app->last_response) {
-        set_status(app, "No reply yet");
-        return;
-    }
-    gdk_clipboard_set_text(gtk_widget_get_clipboard(app->chat_view),
-                           app->last_response);
-    set_status(app, "Reply copied (%" G_GSIZE_FORMAT " bytes)",
-               strlen(app->last_response));
-}
-
-static void on_save_chat_done(GObject *src, GAsyncResult *res, gpointer data)
-{
-    App *app = data;
-    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
-
-    if (f) {
-        char *txt = buffer_text(app->chat_buf);
-        GError *err = NULL;
-
-        if (g_file_replace_contents(f, txt, strlen(txt), NULL, FALSE,
-                                    G_FILE_CREATE_NONE, NULL, NULL, &err))
-            set_status(app, "Chat saved");
-        else {
-            show_error(app, err->message);
-            g_clear_error(&err);
-        }
-        g_free(txt);
-        g_object_unref(f);
-    }
-}
-
-static void on_save_chat(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    GtkFileDialog *d = gtk_file_dialog_new();
-
-    (void)b;
-    gtk_file_dialog_set_title(d, "Save chat transcript");
-    gtk_file_dialog_set_initial_name(d, "chat.md");
-    gtk_file_dialog_save(d, app->win, NULL, on_save_chat_done, app);
-    g_object_unref(d);
-}
-
-/* click on a thinking header expands/collapses that block */
-static void on_chat_click(GtkGestureClick *gesture, gint n_press,
-                          gdouble x, gdouble y, gpointer data)
-{
-    App *app = data;
-    GtkTextView *tv = GTK_TEXT_VIEW(app->chat_view);
-    GtkTextIter it, ss, se;
-    gint bx, by, off;
-    guint i;
-
-    (void)gesture;
-    if (n_press != 1)
-        return;
-    /* a live selection means the user was dragging to select, not toggling */
-    if (gtk_text_buffer_get_selection_bounds(app->chat_buf, &ss, &se))
-        return;
-    if (!app->think_blocks || app->think_blocks->len == 0)
-        return;
-
-    gtk_text_view_window_to_buffer_coords(tv, GTK_TEXT_WINDOW_WIDGET,
-                                          (gint)x, (gint)y, &bx, &by);
-    gtk_text_view_get_iter_at_location(tv, &it, bx, by);
-    off = gtk_text_iter_get_offset(&it);
-
-    for (i = 0; i < app->think_blocks->len; i++) {
-        ThinkBlock *blk = g_ptr_array_index(app->think_blocks, i);
-        GtkTextIter hs, bs;
-
-        if (!blk->head_start || !blk->body_start)
-            continue;
-        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &hs, blk->head_start);
-        gtk_text_buffer_get_iter_at_mark(app->chat_buf, &bs, blk->body_start);
-        if (off >= gtk_text_iter_get_offset(&hs) &&
-            off <  gtk_text_iter_get_offset(&bs)) {
-            think_toggle(app, blk);
-            break;
-        }
-    }
-}
-
-/* enable the "Save selection…" button only while something is selected */
-static void on_chat_selection_changed(GtkTextBuffer *buf, GParamSpec *ps,
-                                      gpointer data)
-{
-    App *app = data;
-
-    (void)ps;
-    if (app->save_sel_btn)
-        gtk_widget_set_sensitive(app->save_sel_btn,
-                                 gtk_text_buffer_get_has_selection(buf));
-}
-
-static void on_save_selection_done(GObject *src, GAsyncResult *res,
-                                   gpointer data)
-{
-    App *app = data;
-    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
-
-    if (f) {
-        GtkTextIter s, e;
-        GError *err = NULL;
-
-        if (gtk_text_buffer_get_selection_bounds(app->chat_buf, &s, &e)) {
-            char *txt = gtk_text_buffer_get_text(app->chat_buf, &s, &e, FALSE);
-
-            if (g_file_replace_contents(f, txt, strlen(txt), NULL, FALSE,
-                                        G_FILE_CREATE_NONE, NULL, NULL, &err))
-                set_status(app, "Selection saved (%" G_GSIZE_FORMAT " bytes)",
-                           strlen(txt));
-            else {
-                show_error(app, err->message);
-                g_clear_error(&err);
-            }
-            g_free(txt);
-        } else {
-            set_status(app, "Selection was cleared before saving");
-        }
-        g_object_unref(f);
-    }
-}
-
-static void on_save_selection(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    GtkTextIter s, e;
-    GtkFileDialog *d;
-
-    (void)b;
-    if (!gtk_text_buffer_get_selection_bounds(app->chat_buf, &s, &e)) {
-        set_status(app, "Select some text in the chat first");
-        return;
-    }
-    d = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(d, "Save selected text");
-    gtk_file_dialog_set_initial_name(d, "selection.txt");
-    gtk_file_dialog_save(d, app->win, NULL, on_save_selection_done, app);
-    g_object_unref(d);
 }
 
 static void on_new_chat(GtkButton *b, gpointer data)
@@ -2297,1873 +3465,514 @@ static void on_new_chat(GtkButton *b, gpointer data)
     App *app = data;
 
     (void)b;
-    if (app->busy) {
-        set_status(app, "Stop the running request first");
+    if (app->busy)
         return;
-    }
-    json_array_unref(app->messages);
-    app->messages = json_array_new();
-    think_clear(app);                   /* drop marks/tags before clearing */
-    gtk_text_buffer_set_text(app->chat_buf, "", -1);
-    g_clear_pointer(&app->last_response, g_free);
-    g_clear_pointer(&app->last_payload, g_free);
-    set_status(app, "New chat");
+    g_ptr_array_set_size(app->history, 0);
+    chat_clear(app);
+    gtk_widget_set_sensitive(app->code_btn, FALSE);
+    g_string_truncate(app->reply_acc, 0);
+    set_status(app, "new conversation");
 }
 
-typedef struct {
-    App     *app;
-    LoadMode mode;
-} AttachJob;
-
-static void on_attach_done(GObject *src, GAsyncResult *res, gpointer data)
+static void on_prov_selected(GObject *o, GParamSpec *ps, gpointer data)
 {
-    AttachJob *j = data;
-    GListModel *files =
-        gtk_file_dialog_open_multiple_finish(GTK_FILE_DIALOG(src), res, NULL);
-
-    if (files) {
-        guint i, n = g_list_model_get_n_items(files);
-
-        for (i = 0; i < n; i++) {
-            GFile *f = g_list_model_get_item(files, i);
-            char *path = g_file_get_path(f);
-
-            if (path) {
-                Attachment *a = g_new0(Attachment, 1);
-
-                a->path = path;
-                a->mode = j->mode;
-                g_ptr_array_add(j->app->attachments, a);
-            }
-            g_object_unref(f);
-        }
-        refresh_attachment_list(j->app);
-        set_status(j->app, "%u file%s attached",
-                   j->app->attachments->len,
-                   j->app->attachments->len == 1 ? "" : "s");
-        g_object_unref(files);
-    }
-    g_free(j);
+    (void)o;
+    (void)ps;
+    provider_apply((App *)data);
 }
 
-static void on_attach_files(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    AttachJob *j = g_new0(AttachJob, 1);
-    GtkFileDialog *d = gtk_file_dialog_new();
-    guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->loadmode_dd));
-
-    (void)b;
-    j->app = app;
-    j->mode = (sel == GTK_INVALID_LIST_POSITION) ? MODE_AUTO : (LoadMode)sel;
-    gtk_file_dialog_set_title(d, "Attach files");
-    gtk_file_dialog_open_multiple(d, app->win, NULL, on_attach_done, j);
-    g_object_unref(d);
-}
-
-static void on_clear_attach(GtkButton *b, gpointer data)
+static void on_key_changed(GtkEditable *e, gpointer data)
 {
     App *app = data;
 
-    (void)b;
-    g_ptr_array_set_size(app->attachments, 0);
-    refresh_attachment_list(app);
-    set_status(app, "Attachments cleared");
+    if (app->quiet)                        /* provider_apply is refilling */
+        return;
+    g_free(app->keys[app->prov_id]);
+    app->keys[app->prov_id] = g_strdup(gtk_editable_get_text(e));
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(app->remember_cb)))
+        config_save_later(app);
 }
 
-/* ==================================================== */
-/* server control and sign-in, model pulling,           */
-/* token ledger with budget                             */
-/* ==================================================== */
-
-/* UI helpers defined further down, used by the page builders below */
-static GtkWidget *section_label(const char *text);
-static GtkWidget *prop_row(const char *label, GtkWidget *w);
-static GtkWidget *make_text_area(GtkTextBuffer **buf_out, gboolean wrap,
-                                 gboolean mono, int min_h);
-
-/* ------------------------------------------------------------------ */
-/* small shared helpers                                                */
-/* ------------------------------------------------------------------ */
-
-static const char *entry_str(GtkWidget *e)
+static void on_host_changed(GtkEditable *e, gpointer data)
 {
+    App *app = data;
+
+    if (app->quiet)                        /* provider_apply is refilling */
+        return;
+    g_free(app->hosts[app->prov_id]);
+    app->hosts[app->prov_id] = g_strdup(gtk_editable_get_text(e));
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(app->remember_cb)))
+        config_save_later(app);
+}
+
+static void on_remember_toggled(GtkCheckButton *cb, gpointer data)
+{
+    (void)cb;
+    config_save((App *)data);
+}
+
+static void on_model_changed(GtkEditable *e, gpointer data)
+{
+    (void)e;
+    quirks_refresh((App *)data);
+}
+
+static void on_quirk_reset(GtkButton *b, gpointer data)
+{
+    App *app = data;
+    char *k = quirk_key(app->prov_id,
+                        gtk_editable_get_text(GTK_EDITABLE(app->model_entry)));
+
+    (void)b;
+    g_hash_table_remove(app->quirks, k);
+    g_free(k);
+    quirks_refresh(app);
+    config_save(app);
+    set_status(app, "learned parameter limits cleared for this model");
+}
+
+static void on_model_selected(GObject *o, GParamSpec *ps, gpointer data)
+{
+    App *app = data;
+    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->model_dd));
+
+    (void)o;
+    (void)ps;
+    if (i == GTK_INVALID_LIST_POSITION || i >= app->models->len)
+        return;
+    gtk_editable_set_text(GTK_EDITABLE(app->model_entry),
+                          g_ptr_array_index(app->models, i));
+}
+
+static void on_model_activate(GtkEntry *e, gpointer data)
+{
+    App *app = data;
     const char *t = gtk_editable_get_text(GTK_EDITABLE(e));
-
-    return t ? t : "";
-}
-
-static double entry_num(GtkWidget *e)
-{
-    char *s = g_strstrip(g_strdup(entry_str(e)));
-    double v = 0.0;
-
-    if (*s)
-        v = g_ascii_strtod(s, NULL);
-    g_free(s);
-    return v;
-}
-
-static char *today_string(void)
-{
-    GDateTime *t = g_date_time_new_now_local();
-    char *s = g_date_time_format(t, "%Y-%m-%d");
-
-    g_date_time_unref(t);
-    return s;
-}
-
-static void log_append(App *app, const char *s)
-{
-    GtkTextIter end;
-    char *safe;
-
-    if (!s || !*s || !app->log_buf)
-        return;
-    safe = g_utf8_make_valid(s, -1);
-    gtk_text_buffer_get_end_iter(app->log_buf, &end);
-    gtk_text_buffer_insert(app->log_buf, &end, safe, -1);
-    g_free(safe);
-}
-
-/* read-only variant of make_text_area */
-static GtkWidget *ro_text_area(GtkTextBuffer **buf_out, gboolean wrap,
-                               gboolean mono, int min_h)
-{
-    GtkWidget *scr = make_text_area(buf_out, wrap, mono, min_h);
-    GtkWidget *v = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(scr));
-
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(v), FALSE);
-    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(v), FALSE);
-    return scr;
-}
-
-/* A model is billed when it carries the cloud tag, or the host is ollama.com */
-static gboolean model_is_cloud(App *app, const char *model)
-{
-    char *base;
-    gboolean cloud_host;
-
-    if (!model || !*model)
-        return FALSE;
-    if (g_str_has_suffix(model, "-cloud") || strstr(model, ":cloud"))
-        return TRUE;
-    base = base_url(app);
-    cloud_host = (strstr(base, "ollama.com") != NULL);
-    g_free(base);
-    return cloud_host;
-}
-
-/* "Authorization: Bearer …", or NULL when no key is set */
-static char *auth_header(App *app)
-{
-    char *key;
-    char *h = NULL;
-
-    if (!app->apikey_entry)
-        return NULL;
-    key = g_strstrip(g_strdup(entry_str(app->apikey_entry)));
-    if (*key)
-        h = g_strdup_printf("Authorization: Bearer %s", key);
-    g_free(key);
-    return h;
-}
-
-/* ------------------------------------------------------------------ */
-/* token ledger                                                       */
-/* ------------------------------------------------------------------ */
-
-static void usage_free(gpointer p)
-{
-    Usage *u = p;
-
-    g_free(u->model);
-    g_free(u);
-}
-
-static Usage *usage_for(App *app, const char *model, gboolean cloud)
-{
-    guint i;
-    Usage *u;
-
-    for (i = 0; i < app->usage->len; i++) {
-        u = g_ptr_array_index(app->usage, i);
-        if (g_strcmp0(u->model, model) == 0)
-            return u;
-    }
-    u = g_new0(Usage, 1);
-    u->model = g_strdup(model);
-    u->cloud = cloud;
-    g_ptr_array_add(app->usage, u);
-    return u;
-}
-
-static void render_usage(App *app)
-{
-    GString *t;
-    double price_in, price_out, budget;
-    const char *cur;
-    double cost;
-    gint64 bill_in = 0, bill_out = 0, free_in = 0, free_out = 0;
-    char *summary;
     guint i;
 
-    if (!app->usage_buf || !app->price_in_e)
+    (void)e;
+    if (!t || !*t)
         return;
-
-    price_in = entry_num(app->price_in_e);
-    price_out = entry_num(app->price_out_e);
-    budget = entry_num(app->budget_e);
-    cur = entry_str(app->currency_e);
-
-    t = g_string_new(NULL);
-    g_string_append_printf(t, "%-30s %5s %10s %10s %7s\n",
-                           "model", "req", "in", "out", "billed");
-    g_string_append(t, "---------------------------------"
-                       "---------------------------\n");
-    for (i = 0; i < app->usage->len; i++) {
-        Usage *u = g_ptr_array_index(app->usage, i);
-
-        g_string_append_printf(t, "%-30s %5" G_GINT64_FORMAT
-                                  " %10" G_GINT64_FORMAT
-                                  " %10" G_GINT64_FORMAT " %7s\n",
-                               u->model, u->requests, u->prompt_tokens,
-                               u->eval_tokens, u->cloud ? "yes" : "no");
-        if (u->cloud) {
-            bill_in += u->prompt_tokens;
-            bill_out += u->eval_tokens;
-        } else {
-            free_in += u->prompt_tokens;
-            free_out += u->eval_tokens;
+    for (i = 0; i < app->models->len; i++)
+        if (!strcmp(g_ptr_array_index(app->models, i), t)) {
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd), i);
+            return;
         }
-    }
-    if (app->usage->len == 0)
-        g_string_append(t, "(nothing recorded yet)\n");
-
-    cost = ((double)bill_in * price_in + (double)bill_out * price_out) / 1.0e6;
-
-    g_string_append_printf(t,
-        "\nbilled    in %" G_GINT64_FORMAT "   out %" G_GINT64_FORMAT
-        "\nlocal     in %" G_GINT64_FORMAT "   out %" G_GINT64_FORMAT
-        "   (not billed)\n", bill_in, bill_out, free_in, free_out);
-    gtk_text_buffer_set_text(app->usage_buf, t->str, -1);
-    g_string_free(t, TRUE);
-
-    if (budget > 0.0) {
-        double within = (cost < budget) ? cost : budget;
-        double extra = (cost > budget) ? cost - budget : 0.0;
-        double left = (budget > cost) ? budget - cost : 0.0;
-
-        summary = g_strdup_printf(
-            "period from %s\nspend %.4f %s against a %.2f %s budget\n"
-            "paid usage %.4f · extra usage %.4f · budget left %.4f %s",
-            app->period_start ? app->period_start : "?",
-            cost, cur, budget, cur, within, extra, left, cur);
-    } else {
-        summary = g_strdup_printf(
-            "period from %s\nestimated spend %.4f %s "
-            "(enter a budget above to track what is left and any overage)",
-            app->period_start ? app->period_start : "?", cost, cur);
-    }
-    gtk_label_set_text(GTK_LABEL(app->usage_summary), summary);
-    g_free(summary);
+    g_ptr_array_add(app->models, g_strdup(t));
+    gtk_string_list_append(app->model_list, t);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd),
+                               (guint)app->models->len - 1);
 }
 
-static void usage_record(App *app, const char *model, gint64 in_tok,
-                         gint64 out_tok)
+/* ================================================================== */
+/*  UI construction                                                   */
+/* ================================================================== */
+
+static void build_settings_pane(App *app, GtkWidget *left)
 {
-    gboolean cloud;
-    Usage *u;
+    GtkWidget *f, *grid, *w, *hbox, *sw, *inner;
+    GtkStringList *provs;
+    int i;
 
-    if (!model || !*model || (in_tok <= 0 && out_tok <= 0))
-        return;
-    cloud = model_is_cloud(app, model);
-    u = usage_for(app, model, cloud);
-    u->cloud = u->cloud || cloud;
-    u->requests += 1;
-    if (in_tok > 0)
-        u->prompt_tokens += in_tok;
-    if (out_tok > 0)
-        u->eval_tokens += out_tok;
-    render_usage(app);
-}
+    /* ---- provider pad ---- */
+    f = gtk_frame_new("Provider / API key");
+    grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    margins(grid, 8);
+    gtk_frame_set_child(GTK_FRAME(f), grid);
 
-/* ------------------------------------------------------------------ */
-/* configuration and ledger persistence                               */
-/* ------------------------------------------------------------------ */
+    provs = gtk_string_list_new(NULL);
+    for (i = 0; i < PROV_COUNT; i++)
+        gtk_string_list_append(provs, prov_get((ProvId)i)->label);
+    app->prov_dd = gtk_drop_down_new(G_LIST_MODEL(provs), NULL);
+    g_object_unref(provs);
 
-static char *state_path(void)
-{
-    return g_build_filename(g_get_user_config_dir(), "ollama-gui",
-                            "state.json", NULL);
-}
+    app->key_e = gtk_password_entry_new();
+    gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(app->key_e), TRUE);
+    app->host_e = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(app->host_e), "https://…");
 
-static void load_state(App *app)
-{
-    char *path = state_path();
-    char *data = NULL;
-    gsize len = 0;
-    JsonParser *p;
-    JsonObject *o = NULL;
-    const char *env;
-    const char *s;
+    w = gtk_label_new("Provider");
+    gtk_widget_set_halign(w, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), w, 0, 0, 1, 1);
+    gtk_widget_set_hexpand(app->prov_dd, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), app->prov_dd, 1, 0, 1, 1);
 
-    env = g_getenv("OLLAMA_API_KEY");
-    app->cfg_host = g_strdup("http://localhost:11434");
-    app->cfg_key = g_strdup(env ? env : "");
-    app->cfg_price_in = g_strdup("0");
-    app->cfg_price_out = g_strdup("0");
-    app->cfg_budget = g_strdup("0");
-    app->cfg_currency = g_strdup("USD");
-    app->cfg_serve_cmd = g_strdup("ollama serve");
-    app->cfg_signin_cmd = g_strdup("ollama signin");
-    app->cfg_remember_key = FALSE;
-    app->period_start = today_string();
+    w = gtk_label_new("API key");
+    gtk_widget_set_halign(w, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), w, 0, 1, 1, 1);
+    gtk_widget_set_hexpand(app->key_e, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), app->key_e, 1, 1, 1, 1);
 
-    if (!g_file_get_contents(path, &data, &len, NULL)) {
-        g_free(path);
-        return;
+    w = gtk_label_new("Host");
+    gtk_widget_set_halign(w, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), w, 0, 2, 1, 1);
+    gtk_widget_set_hexpand(app->host_e, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), app->host_e, 1, 2, 1, 1);
+
+    hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    {
+        GtkWidget *load = gtk_button_new_with_label("Load models");
+        GtkWidget *prev = gtk_button_new_with_label("Preview request");
+
+        gtk_box_append(GTK_BOX(hbox), load);
+        gtk_box_append(GTK_BOX(hbox), prev);
+        g_signal_connect(load, "clicked", G_CALLBACK(on_load_models), app);
+        g_signal_connect(prev, "clicked", G_CALLBACK(on_preview), app);
     }
-    p = json_parser_new();
-    if (json_parser_load_from_data(p, data, (gssize)len, NULL)) {
-        JsonNode *root = json_parser_get_root(p);
+    gtk_grid_attach(GTK_GRID(grid), hbox, 1, 3, 1, 1);
 
-        if (root && JSON_NODE_HOLDS_OBJECT(root))
-            o = json_node_get_object(root);
-    }
-    if (o) {
-        JsonArray *arr;
+    app->remember_cb = gtk_check_button_new_with_label(
+            "Remember keys on disk (chmod 600)");
+    gtk_grid_attach(GTK_GRID(grid), app->remember_cb, 0, 4, 2, 1);
+    gtk_box_append(GTK_BOX(left), f);
 
-#define TAKE_STR(field, key)                    \
-        s = obj_str(o, key);                    \
-        if (s && *s) {                          \
-            g_free(app->field);                 \
-            app->field = g_strdup(s);           \
+    /* ---- model ---- */
+    f = gtk_frame_new("Model");
+    grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    margins(grid, 8);
+    gtk_frame_set_child(GTK_FRAME(f), grid);
+
+    app->model_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(app->model_entry),
+        "llama3.1 · gpt-4o-mini · claude-sonnet-4-5 · gemini-2.5-flash");
+    gtk_widget_set_hexpand(app->model_entry, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), app->model_entry, 0, 0, 1, 1);
+
+    app->model_list = gtk_string_list_new(NULL);
+    app->model_dd = gtk_drop_down_new(G_LIST_MODEL(app->model_list), NULL);
+    gtk_widget_set_hexpand(app->model_dd, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), app->model_dd, 0, 1, 1, 1);
+    gtk_box_append(GTK_BOX(left), f);
+
+    /* ---- system prompt ---- */
+    f = gtk_frame_new("System prompt");
+    app->sys_buf = gtk_text_buffer_new(NULL);
+    w = gtk_text_view_new_with_buffer(app->sys_buf);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(w), GTK_WRAP_WORD);
+    sw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), w);
+    gtk_widget_set_size_request(sw, -1, 90);
+    inner = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    margins(inner, 8);
+    gtk_box_append(GTK_BOX(inner), sw);
+    gtk_frame_set_child(GTK_FRAME(f), inner);
+    gtk_box_append(GTK_BOX(left), f);
+
+    /* ---- parameters ---- */
+    f = gtk_frame_new("Parameters");
+    grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    margins(grid, 8);
+    gtk_frame_set_child(GTK_FRAME(f), grid);
+    {
+        struct {
+            const char *lbl, *tip;
+            GtkWidget **cb, **e;
+            const char *dflt;
+        } rows[] = {
+            { "Temperature", "Sampling temperature. Unchecked: not sent.",
+              &app->temp_cb, &app->temp_e, "0.8" },
+            { "Top-p", "Nucleus sampling. Unchecked: not sent. Anthropic gets "
+              "temperature or top-p, never both.",
+              &app->topp_cb, &app->topp_e, "0.9" },
+            { "Max tokens", "Unchecked: provider default. Anthropic requires a "
+              "value and then gets 8192 (16000 with thinking on).",
+              &app->maxtok_cb, &app->maxtok_e, "4096" },
+            { "Seed", "Fixed seed for repeatable sampling. Not sent to "
+              "Anthropic, which has no seed.",
+              &app->seed_cb, &app->seed_e, "42" },
+        };
+        static const char *const think_opts[] = {
+            "Model default (not sent)", "On", "Off", NULL
+        };
+        static const char *const effort_opts[] = {
+            "Model default (not sent)", "low", "medium", "high", "xhigh", "max",
+            NULL
+        };
+        int r;
+
+        for (r = 0; r < 4; r++) {
+            *rows[r].cb = gtk_check_button_new_with_label(rows[r].lbl);
+            gtk_widget_set_tooltip_text(*rows[r].cb, rows[r].tip);
+            gtk_grid_attach(GTK_GRID(grid), *rows[r].cb, 0, r, 1, 1);
+            *rows[r].e = gtk_entry_new();
+            gtk_editable_set_text(GTK_EDITABLE(*rows[r].e), rows[r].dflt);
+            gtk_widget_set_hexpand(*rows[r].e, TRUE);
+            gtk_grid_attach(GTK_GRID(grid), *rows[r].e, 1, r, 1, 1);
+            g_object_bind_property(*rows[r].cb, "active", *rows[r].e,
+                                   "sensitive", G_BINDING_SYNC_CREATE);
         }
-        TAKE_STR(cfg_host, "host")
-        TAKE_STR(cfg_price_in, "price_in")
-        TAKE_STR(cfg_price_out, "price_out")
-        TAKE_STR(cfg_budget, "budget")
-        TAKE_STR(cfg_currency, "currency")
-        TAKE_STR(cfg_serve_cmd, "serve_cmd")
-        TAKE_STR(cfg_signin_cmd, "signin_cmd")
-        TAKE_STR(period_start, "period_start")
-#undef TAKE_STR
-        app->cfg_remember_key = obj_true(o, "remember_key");
-        if (app->cfg_remember_key) {
-            s = obj_str(o, "api_key");
-            if (s && *s) {
-                g_free(app->cfg_key);
-                app->cfg_key = g_strdup(s);
-            }
-        }
-        arr = json_object_has_member(o, "usage")
-                  ? json_object_get_array_member(o, "usage") : NULL;
-        if (arr) {
-            guint i, n = json_array_get_length(arr);
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(app->temp_cb), TRUE);
 
-            for (i = 0; i < n; i++) {
-                JsonNode *el = json_array_get_element(arr, i);
-                JsonObject *uo;
-                Usage *u;
+        w = gtk_label_new("Thinking");
+        gtk_widget_set_halign(w, GTK_ALIGN_START);
+        gtk_grid_attach(GTK_GRID(grid), w, 0, 4, 1, 1);
+        app->think_dd = gtk_drop_down_new_from_strings(think_opts);
+        gtk_widget_set_tooltip_text(app->think_dd,
+            "Off is never sent to models whose thinking cannot be disabled "
+            "(Claude Fable / Mythos).");
+        gtk_grid_attach(GTK_GRID(grid), app->think_dd, 1, 4, 1, 1);
 
-                if (!JSON_NODE_HOLDS_OBJECT(el))
-                    continue;
-                uo = json_node_get_object(el);
-                if (!obj_str(uo, "model"))
-                    continue;
-                u = g_new0(Usage, 1);
-                u->model = g_strdup(obj_str(uo, "model"));
-                u->cloud = obj_true(uo, "cloud");
-                u->requests = obj_int(uo, "requests", 0);
-                u->prompt_tokens = obj_int(uo, "prompt_tokens", 0);
-                u->eval_tokens = obj_int(uo, "eval_tokens", 0);
-                g_ptr_array_add(app->usage, u);
-            }
-        }
+        w = gtk_label_new("Effort");
+        gtk_widget_set_halign(w, GTK_ALIGN_START);
+        gtk_grid_attach(GTK_GRID(grid), w, 0, 5, 1, 1);
+        app->effort_dd = gtk_drop_down_new_from_strings(effort_opts);
+        gtk_widget_set_tooltip_text(app->effort_dd,
+            "Anthropic: output_config.effort. OpenAI: reasoning_effort "
+            "(xhigh/max sent as high). Not used for Gemini or Ollama.");
+        gtk_grid_attach(GTK_GRID(grid), app->effort_dd, 1, 5, 1, 1);
+
+        app->adapt_cb = gtk_check_button_new_with_label(
+            "Auto-adapt: drop parameters the API rejects, then retry");
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(app->adapt_cb), TRUE);
+        gtk_grid_attach(GTK_GRID(grid), app->adapt_cb, 0, 6, 2, 1);
+
+        hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        app->quirk_label = gtk_label_new(NULL);
+        gtk_label_set_wrap(GTK_LABEL(app->quirk_label), TRUE);
+        gtk_label_set_xalign(GTK_LABEL(app->quirk_label), 0.0f);
+        gtk_widget_add_css_class(app->quirk_label, "dim-label");
+        gtk_widget_add_css_class(app->quirk_label, "note");
+        gtk_widget_set_hexpand(app->quirk_label, TRUE);
+        app->quirk_reset = gtk_button_new_with_label("Reset");
+        gtk_widget_set_tooltip_text(app->quirk_reset,
+            "Forget what was learned for this model");
+        gtk_widget_set_valign(app->quirk_reset, GTK_ALIGN_CENTER);
+        gtk_box_append(GTK_BOX(hbox), app->quirk_label);
+        gtk_box_append(GTK_BOX(hbox), app->quirk_reset);
+        gtk_widget_set_visible(app->quirk_label, FALSE);
+        gtk_widget_set_visible(app->quirk_reset, FALSE);
+        gtk_grid_attach(GTK_GRID(grid), hbox, 0, 7, 2, 1);
     }
-    g_object_unref(p);
-    g_free(data);
-    g_free(path);
+    hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    app->stream_cb = gtk_check_button_new_with_label("Stream");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->stream_cb), TRUE);
+    app->newchat_btn = gtk_button_new_with_label("New chat");
+    gtk_box_append(GTK_BOX(hbox), app->stream_cb);
+    gtk_box_append(GTK_BOX(hbox), app->newchat_btn);
+    gtk_grid_attach(GTK_GRID(grid), hbox, 0, 8, 2, 1);
+    gtk_box_append(GTK_BOX(left), f);
+
+    /* pad signal wiring */
+    g_signal_connect(app->prov_dd, "notify::selected",
+                     G_CALLBACK(on_prov_selected), app);
+    g_signal_connect(app->key_e, "changed", G_CALLBACK(on_key_changed), app);
+    g_signal_connect(app->host_e, "changed", G_CALLBACK(on_host_changed), app);
+    g_signal_connect(app->remember_cb, "toggled",
+                     G_CALLBACK(on_remember_toggled), app);
+    g_signal_connect(app->model_dd, "notify::selected",
+                     G_CALLBACK(on_model_selected), app);
+    g_signal_connect(app->model_entry, "activate",
+                     G_CALLBACK(on_model_activate), app);
+    g_signal_connect(app->model_entry, "changed",
+                     G_CALLBACK(on_model_changed), app);
+    g_signal_connect(app->quirk_reset, "clicked",
+                     G_CALLBACK(on_quirk_reset), app);
+    g_signal_connect(app->newchat_btn, "clicked",
+                     G_CALLBACK(on_new_chat), app);
 }
 
-static void save_state(App *app)
+static void build_chat_pane(App *app, GtkWidget *right)
 {
-    char *path, *dir, *text;
-    JsonBuilder *b;
-    JsonNode *root;
-    gboolean remember;
-    guint i;
+    GtkWidget *sw, *cbox, *row, *arow, *scroll_in;
+    GtkEventController *key;
 
-    if (!app->host_entry || !app->remember_key_cb)
-        return;                          /* widgets not built yet */
+    app->chat_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(app->chat_box, "chat");
 
-    path = state_path();
-    dir = g_path_get_dirname(path);
-    g_mkdir_with_parents(dir, 0700);
-    remember = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->remember_key_cb));
+    sw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                    GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), app->chat_box);
+    gtk_widget_set_vexpand(sw, TRUE);
+    gtk_box_append(GTK_BOX(right), sw);
+    app->chat_adj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw));
+    app->follow = TRUE;
+    g_signal_connect(app->chat_adj, "value-changed",
+                     G_CALLBACK(on_adj_value), app);
+    g_signal_connect(app->chat_adj, "notify::upper",
+                     G_CALLBACK(on_adj_bounds), app);
+    g_signal_connect(app->chat_adj, "notify::page-size",
+                     G_CALLBACK(on_adj_bounds), app);
 
-    b = json_builder_new();
-    json_builder_begin_object(b);
-    json_builder_set_member_name(b, "host");
-    json_builder_add_string_value(b, entry_str(app->host_entry));
-    json_builder_set_member_name(b, "price_in");
-    json_builder_add_string_value(b, entry_str(app->price_in_e));
-    json_builder_set_member_name(b, "price_out");
-    json_builder_add_string_value(b, entry_str(app->price_out_e));
-    json_builder_set_member_name(b, "budget");
-    json_builder_add_string_value(b, entry_str(app->budget_e));
-    json_builder_set_member_name(b, "currency");
-    json_builder_add_string_value(b, entry_str(app->currency_e));
-    json_builder_set_member_name(b, "serve_cmd");
-    json_builder_add_string_value(b, entry_str(app->serve_cmd_e));
-    json_builder_set_member_name(b, "signin_cmd");
-    json_builder_add_string_value(b, entry_str(app->signin_cmd_e));
-    json_builder_set_member_name(b, "period_start");
-    json_builder_add_string_value(b, app->period_start ? app->period_start : "");
-    json_builder_set_member_name(b, "remember_key");
-    json_builder_add_boolean_value(b, remember);
-    json_builder_set_member_name(b, "api_key");
-    json_builder_add_string_value(b, remember ? entry_str(app->apikey_entry) : "");
+    cbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    app->input_buf = gtk_text_buffer_new(NULL);
+    {
+        GtkWidget *iv = gtk_text_view_new_with_buffer(app->input_buf);
 
-    json_builder_set_member_name(b, "usage");
-    json_builder_begin_array(b);
-    for (i = 0; i < app->usage->len; i++) {
-        Usage *u = g_ptr_array_index(app->usage, i);
-
-        json_builder_begin_object(b);
-        json_builder_set_member_name(b, "model");
-        json_builder_add_string_value(b, u->model);
-        json_builder_set_member_name(b, "cloud");
-        json_builder_add_boolean_value(b, u->cloud);
-        json_builder_set_member_name(b, "requests");
-        json_builder_add_int_value(b, u->requests);
-        json_builder_set_member_name(b, "prompt_tokens");
-        json_builder_add_int_value(b, u->prompt_tokens);
-        json_builder_set_member_name(b, "eval_tokens");
-        json_builder_add_int_value(b, u->eval_tokens);
-        json_builder_end_object(b);
+        gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(iv), GTK_WRAP_WORD);
+        key = gtk_event_controller_key_new();
+        g_signal_connect(key, "key-pressed", G_CALLBACK(on_input_key), app);
+        gtk_widget_add_controller(iv, key);
+        scroll_in = gtk_scrolled_window_new();
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_in),
+                                        GTK_POLICY_AUTOMATIC,
+                                        GTK_POLICY_AUTOMATIC);
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll_in), iv);
+        gtk_widget_set_size_request(scroll_in, -1, 90);
     }
-    json_builder_end_array(b);
-    json_builder_end_object(b);
 
-    root = json_builder_get_root(b);
-    text = node_to_string(root, TRUE);
-    if (g_file_set_contents(path, text, -1, NULL))
-        g_chmod(path, 0600);             /* the file can hold an API key */
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    app->send_btn = gtk_button_new_with_label("Send");
+    app->stop_btn = gtk_button_new_with_label("Stop");
+    gtk_widget_set_sensitive(app->stop_btn, FALSE);
+    app->spinner = gtk_spinner_new();
+    app->status = gtk_label_new("ready");
+    gtk_widget_set_halign(app->status, GTK_ALIGN_START);
+    gtk_widget_set_hexpand(app->status, TRUE);
+    g_signal_connect(app->send_btn, "clicked", G_CALLBACK(on_send), app);
+    g_signal_connect(app->stop_btn, "clicked", G_CALLBACK(on_stop), app);
 
-    g_free(text);
-    json_node_free(root);
-    g_object_unref(b);
-    g_free(dir);
-    g_free(path);
+    gtk_box_append(GTK_BOX(row), app->send_btn);
+    gtk_box_append(GTK_BOX(row), app->stop_btn);
+    gtk_box_append(GTK_BOX(row), app->spinner);
+    gtk_box_append(GTK_BOX(row), app->status);
+    {
+        GtkWidget *save_btn = gtk_button_new_with_label("Save chat…");
+
+        app->code_btn = gtk_button_new_with_label("Save code…");
+        gtk_widget_set_sensitive(app->code_btn, FALSE);
+        g_signal_connect(save_btn, "clicked", G_CALLBACK(on_save_chat), app);
+        g_signal_connect(app->code_btn, "clicked",
+                         G_CALLBACK(on_save_code), app);
+        gtk_box_append(GTK_BOX(row), save_btn);
+        gtk_box_append(GTK_BOX(row), app->code_btn);
+    }
+
+    /* attachment strip between the composer and the send row */
+    arow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    {
+        GtkWidget *attach_btn = gtk_button_new_with_label("Attach…");
+
+        app->att_clear_btn = gtk_button_new_with_label("Clear");
+        app->att_label = gtk_label_new("no attachments");
+        gtk_label_set_ellipsize(GTK_LABEL(app->att_label), PANGO_ELLIPSIZE_END);
+        gtk_widget_set_halign(app->att_label, GTK_ALIGN_START);
+        gtk_widget_set_hexpand(app->att_label, TRUE);
+        gtk_widget_add_css_class(app->att_label, "dim-label");
+        gtk_widget_set_sensitive(app->att_clear_btn, FALSE);
+        g_signal_connect(attach_btn, "clicked", G_CALLBACK(on_attach), app);
+        g_signal_connect(app->att_clear_btn, "clicked",
+                         G_CALLBACK(on_att_clear), app);
+        gtk_box_append(GTK_BOX(arow), attach_btn);
+        gtk_box_append(GTK_BOX(arow), app->att_clear_btn);
+        gtk_box_append(GTK_BOX(arow), app->att_label);
+    }
+
+    gtk_box_append(GTK_BOX(cbox), scroll_in);
+    gtk_box_append(GTK_BOX(cbox), arow);
+    gtk_box_append(GTK_BOX(cbox), row);
+    gtk_box_append(GTK_BOX(right), cbox);
 }
 
-static void on_usage_apply(GtkButton *b, gpointer data)
+/* ================================================================== */
+/*  application lifecycle                                             */
+/* ================================================================== */
+
+/* Save while the widgets still exist. "shutdown" fires only after the
+ * window has been destroyed, so config_save() there read freed widgets. */
+static gboolean on_close_request(GtkWindow *w, gpointer data)
 {
     App *app = data;
 
-    (void)b;
-    render_usage(app);
-    save_state(app);
-    set_status(app, "Prices and budget applied");
-}
-
-static void on_usage_reset(GtkButton *b, gpointer data)
-{
-    App *app = data;
-
-    (void)b;
-    g_ptr_array_set_size(app->usage, 0);
-    g_free(app->period_start);
-    app->period_start = today_string();
-    render_usage(app);
-    save_state(app);
-    set_status(app, "Usage period restarted");
-}
-
-static void on_save_usage_done(GObject *src, GAsyncResult *res, gpointer data)
-{
-    App *app = data;
-    GError *err = NULL;
-    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, &err);
-    char *path, *text;
-
-    if (!f) {
-        g_clear_error(&err);
-        return;
+    (void)w;
+    if (app->save_id) {
+        g_source_remove(app->save_id);
+        app->save_id = 0;
     }
-    path = g_file_get_path(f);
-    g_object_unref(f);
-    if (!path)
-        return;
-    text = buffer_text(app->usage_buf);
-    if (!g_file_set_contents(path, text, -1, &err)) {
-        show_error(app, err->message);
-        g_clear_error(&err);
-    } else {
-        set_status(app, "Written: %s", path);
-    }
-    g_free(text);
-    g_free(path);
-}
-
-static void on_save_usage(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    GtkFileDialog *d = gtk_file_dialog_new();
-
-    (void)b;
-    gtk_file_dialog_set_title(d, "Save usage table");
-    gtk_file_dialog_set_initial_name(d, "usage.txt");
-    gtk_file_dialog_save(d, app->win, NULL, on_save_usage_done, app);
-    g_object_unref(d);
-}
-
-/* ------------------------------------------------------------------ */
-/* server version probe (async)                                       */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    App  *app;
-    char *url;
-    char *auth;
-    char *text;                          /* filled in by the worker */
-} Probe;
-
-static void probe_free(gpointer p)
-{
-    Probe *pr = p;
-
-    g_free(pr->url);
-    g_free(pr->auth);
-    g_free(pr->text);
-    g_free(pr);
-}
-
-static gboolean ui_probe_cb(gpointer p)
-{
-    Probe *pr = p;
-
-    if (pr->app->version_label)
-        gtk_label_set_text(GTK_LABEL(pr->app->version_label),
-                           pr->text ? pr->text : "server: unknown");
-    return G_SOURCE_REMOVE;
-}
-
-static gpointer probe_worker(gpointer data)
-{
-    Probe *pr = data;
-    CURL *curl = curl_easy_init();
-    GString *body = g_string_new(NULL);
-    struct curl_slist *hdrs = NULL;
-    CURLcode cc;
-    long code = 0;
-
-    if (pr->auth)
-        hdrs = curl_slist_append(hdrs, pr->auth);
-    curl_easy_setopt(curl, CURLOPT_URL, pr->url);
-    if (hdrs)
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, get_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 6L);
-    cc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    if (hdrs)
-        curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-
-    if (cc != CURLE_OK) {
-        pr->text = g_strdup_printf("server: not reachable (%s)",
-                                   curl_easy_strerror(cc));
-    } else if (code != 200) {
-        pr->text = g_strdup_printf("server: HTTP %ld from /api/version", code);
-    } else {
-        JsonParser *p = json_parser_new();
-        const char *v = NULL;
-
-        if (json_parser_load_from_data(p, body->str, (gssize)body->len, NULL)) {
-            JsonNode *root = json_parser_get_root(p);
-
-            if (root && JSON_NODE_HOLDS_OBJECT(root))
-                v = obj_str(json_node_get_object(root), "version");
-        }
-        pr->text = g_strdup_printf("server: running, version %s",
-                                   v ? v : "unknown");
-        g_object_unref(p);
-    }
-    g_string_free(body, TRUE);
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_probe_cb, pr, probe_free);
-    return NULL;
-}
-
-static void start_version_probe(App *app)
-{
-    Probe *pr = g_new0(Probe, 1);
-    char *base = base_url(app);
-
-    pr->app = app;
-    pr->url = g_strdup_printf("%s/api/version", base);
-    pr->auth = auth_header(app);
-    g_free(base);
-    g_thread_unref(g_thread_new("ollama-version", probe_worker, pr));
-}
-
-static void on_probe_clicked(GtkButton *b, gpointer data)
-{
-    (void)b;
-    start_version_probe(data);
-}
-
-/* ------------------------------------------------------------------ */
-/* installed-model inventory: /api/tags plus /api/ps (async)          */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    App  *app;
-    char *tags_url;
-    char *ps_url;
-    char *auth;
-    char *table;                         /* filled in by the worker */
-} Inventory;
-
-static void inventory_free(gpointer p)
-{
-    Inventory *inv = p;
-
-    g_free(inv->tags_url);
-    g_free(inv->ps_url);
-    g_free(inv->auth);
-    g_free(inv->table);
-    g_free(inv);
-}
-
-static gboolean ui_inventory_cb(gpointer p)
-{
-    Inventory *inv = p;
-
-    if (inv->app->models_buf)
-        gtk_text_buffer_set_text(inv->app->models_buf,
-                                 inv->table ? inv->table : "", -1);
-    return G_SOURCE_REMOVE;
-}
-
-static long simple_get(const char *url, const char *auth, GString *body)
-{
-    CURL *curl = curl_easy_init();
-    struct curl_slist *hdrs = NULL;
-    long code = 0;
-
-    if (!curl)
-        return 0;
-    if (auth)
-        hdrs = curl_slist_append(hdrs, auth);
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    if (hdrs)
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, get_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    if (curl_easy_perform(curl) == CURLE_OK)
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    if (hdrs)
-        curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-    return code;
-}
-
-static JsonArray *models_array_of(JsonParser *p, const char *body, gsize len)
-{
-    JsonNode *root;
-    JsonObject *o;
-
-    if (!json_parser_load_from_data(p, body, (gssize)len, NULL))
-        return NULL;
-    root = json_parser_get_root(p);
-    if (!root || !JSON_NODE_HOLDS_OBJECT(root))
-        return NULL;
-    o = json_node_get_object(root);
-    if (!json_object_has_member(o, "models"))
-        return NULL;
-    if (!JSON_NODE_HOLDS_ARRAY(json_object_get_member(o, "models")))
-        return NULL;
-    return json_object_get_array_member(o, "models");
-}
-
-static gpointer inventory_worker(gpointer data)
-{
-    Inventory *inv = data;
-    GString *tags = g_string_new(NULL);
-    GString *ps = g_string_new(NULL);
-    GString *table = g_string_new(NULL);
-    GPtrArray *loaded = g_ptr_array_new_with_free_func(g_free);
-    JsonParser *pt = json_parser_new();
-    JsonParser *pp = json_parser_new();
-    JsonArray *arr;
-    guint i, j, n;
-
-    if (simple_get(inv->tags_url, inv->auth, tags) != 200) {
-        g_string_append(table, "(cannot read /api/tags — is the server "
-                               "running? see the Server page)\n");
-        goto out;
-    }
-    if (simple_get(inv->ps_url, inv->auth, ps) == 200) {
-        JsonArray *pa = models_array_of(pp, ps->str, ps->len);
-
-        n = pa ? json_array_get_length(pa) : 0;
-        for (i = 0; i < n; i++) {
-            JsonNode *el = json_array_get_element(pa, i);
-            const char *nm;
-
-            if (!JSON_NODE_HOLDS_OBJECT(el))
-                continue;
-            nm = obj_str(json_node_get_object(el), "name");
-            if (!nm)
-                nm = obj_str(json_node_get_object(el), "model");
-            if (nm)
-                g_ptr_array_add(loaded, g_strdup(nm));
-        }
-    }
-
-    g_string_append_printf(table, "%-32s %8s %8s %8s %7s\n",
-                           "model", "size", "params", "quant", "loaded");
-    g_string_append(table, "-----------------------------------"
-                           "---------------------------\n");
-
-    arr = models_array_of(pt, tags->str, tags->len);
-    n = arr ? json_array_get_length(arr) : 0;
-    for (i = 0; i < n; i++) {
-        JsonNode *el = json_array_get_element(arr, i);
-        JsonObject *mo, *det = NULL;
-        const char *name, *params = "", *quant = "";
-        gint64 size;
-        gboolean is_loaded = FALSE;
-
-        if (!JSON_NODE_HOLDS_OBJECT(el))
-            continue;
-        mo = json_node_get_object(el);
-        name = obj_str(mo, "name");
-        if (!name)
-            name = obj_str(mo, "model");
-        if (!name)
-            continue;
-        if (json_object_has_member(mo, "details") &&
-            JSON_NODE_HOLDS_OBJECT(json_object_get_member(mo, "details")))
-            det = json_object_get_object_member(mo, "details");
-        if (det) {
-            const char *s = obj_str(det, "parameter_size");
-            const char *q = obj_str(det, "quantization_level");
-
-            if (s)
-                params = s;
-            if (q)
-                quant = q;
-        }
-        size = obj_int(mo, "size", 0);
-        for (j = 0; j < loaded->len; j++) {
-            if (g_strcmp0(g_ptr_array_index(loaded, j), name) == 0) {
-                is_loaded = TRUE;
-                break;
-            }
-        }
-        g_string_append_printf(table, "%-32s %7.2fG %8s %8s %7s\n",
-                               name, (double)size / 1.0e9, params, quant,
-                               is_loaded ? "yes" : "");
-    }
-    if (n == 0)
-        g_string_append(table, "(no models installed — pull one above)\n");
-
-out:
-    inv->table = g_string_free(table, FALSE);
-    g_object_unref(pt);
-    g_object_unref(pp);
-    g_ptr_array_free(loaded, TRUE);
-    g_string_free(tags, TRUE);
-    g_string_free(ps, TRUE);
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_inventory_cb, inv,
-                    inventory_free);
-    return NULL;
-}
-
-static void start_inventory_load(App *app)
-{
-    Inventory *inv = g_new0(Inventory, 1);
-    char *base = base_url(app);
-
-    inv->app = app;
-    inv->tags_url = g_strdup_printf("%s/api/tags", base);
-    inv->ps_url = g_strdup_printf("%s/api/ps", base);
-    inv->auth = auth_header(app);
-    g_free(base);
-    g_thread_unref(g_thread_new("ollama-inventory", inventory_worker, inv));
-}
-
-static void on_refresh_all(GtkButton *b, gpointer data)
-{
-    App *app = data;
-
-    (void)b;
-    start_models_load(app);
-    start_inventory_load(app);
-    start_version_probe(app);
-}
-
-/* ------------------------------------------------------------------ */
-/* pulling a model (/api/pull, streaming progress)                    */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    App     *app;
-    char    *url;
-    char    *body;
-    char    *auth;
-    GString *pending;
-    long     http_code;
-} PullReq;
-
-typedef struct {
-    App     *app;
-    char    *text;
-    double   fraction;                   /* < 0 leaves the bar alone */
-    gboolean done;
-} UiPull;
-
-static void ui_pull_free(gpointer p)
-{
-    UiPull *u = p;
-
-    g_free(u->text);
-    g_free(u);
-}
-
-static gboolean ui_pull_cb(gpointer p)
-{
-    UiPull *u = p;
-    App *app = u->app;
-
-    if (u->fraction >= 0.0)
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->pull_bar),
-                                      u->fraction);
-    if (u->text)
-        gtk_label_set_text(GTK_LABEL(app->pull_status), u->text);
-    if (u->done) {
-        app->pulling = FALSE;
-        gtk_widget_set_sensitive(app->pull_btn, TRUE);
-        start_models_load(app);          /* the dropdown picks it up */
-        start_inventory_load(app);
-    }
-    return G_SOURCE_REMOVE;
-}
-
-static void post_pull(App *app, const char *text, double fraction,
-                      gboolean done)
-{
-    UiPull *u = g_new0(UiPull, 1);
-
-    u->app = app;
-    u->text = text ? g_strdup(text) : NULL;
-    u->fraction = fraction;
-    u->done = done;
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, ui_pull_cb, u, ui_pull_free);
-}
-
-static void handle_pull_line(PullReq *r, const char *line)
-{
-    JsonParser *p;
-    JsonNode *root;
-    JsonObject *o = NULL;
-    const char *status, *errm;
-    gint64 total, completed;
-    double frac = -1.0;
-
-    while (*line == ' ' || *line == '\t' || *line == '\r')
-        line++;
-    if (!*line)
-        return;
-
-    p = json_parser_new();
-    if (!json_parser_load_from_data(p, line, -1, NULL)) {
-        g_object_unref(p);
-        return;
-    }
-    root = json_parser_get_root(p);
-    if (root && JSON_NODE_HOLDS_OBJECT(root))
-        o = json_node_get_object(root);
-
-    errm = obj_str(o, "error");
-    if (errm) {
-        post_pull(r->app, errm, -1.0, FALSE);
-        g_object_unref(p);
-        return;
-    }
-    status = obj_str(o, "status");
-    total = obj_int(o, "total", 0);
-    completed = obj_int(o, "completed", 0);
-    if (total > 0)
-        frac = (double)completed / (double)total;
-    if (status) {
-        char *label;
-
-        if (total > 0)
-            label = g_strdup_printf("%s  %.1f / %.1f MB", status,
-                                    (double)completed / 1.0e6,
-                                    (double)total / 1.0e6);
-        else
-            label = g_strdup(status);
-        post_pull(r->app, label, frac, FALSE);
-        g_free(label);
-    }
-    g_object_unref(p);
-}
-
-static size_t pull_write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
-{
-    PullReq *r = ud;
-    size_t n = size * nmemb, consumed = 0;
-    char *buf, *nl;
-
-    if (g_atomic_int_get(&r->app->pull_cancel))
-        return 0;                        /* abort the transfer */
-
-    g_string_append_len(r->pending, ptr, (gssize)n);
-    buf = r->pending->str;
-    while ((nl = memchr(buf + consumed, '\n', r->pending->len - consumed))) {
-        size_t off = (size_t)(nl - buf);
-        char *line = g_strndup(buf + consumed, off - consumed);
-
-        handle_pull_line(r, line);
-        g_free(line);
-        consumed = off + 1;
-    }
-    if (consumed)
-        g_string_erase(r->pending, 0, (gssize)consumed);
-    return n;
-}
-
-static gpointer pull_worker(gpointer data)
-{
-    PullReq *r = data;
-    CURL *curl = curl_easy_init();
-    struct curl_slist *hdrs = NULL;
-    CURLcode cc;
-
-    if (!curl) {
-        post_pull(r->app, "curl init failed", -1.0, TRUE);
-        goto done;
-    }
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    if (r->auth)
-        hdrs = curl_slist_append(hdrs, r->auth);
-    curl_easy_setopt(curl, CURLOPT_URL, r->url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, r->body);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(r->body));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, pull_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, r);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-
-    cc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r->http_code);
-
-    if (cc == CURLE_WRITE_ERROR && g_atomic_int_get(&r->app->pull_cancel)) {
-        post_pull(r->app, "pull cancelled", -1.0, TRUE);
-    } else if (cc != CURLE_OK) {
-        post_pull(r->app, curl_easy_strerror(cc), -1.0, TRUE);
-    } else if (r->http_code != 200) {
-        char *m = g_strdup_printf("HTTP %ld", r->http_code);
-
-        post_pull(r->app, m, -1.0, TRUE);
-        g_free(m);
-    } else {
-        post_pull(r->app, "pull complete", 1.0, TRUE);
-    }
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-
-done:
-    g_free(r->url);
-    g_free(r->body);
-    g_free(r->auth);
-    g_string_free(r->pending, TRUE);
-    g_free(r);
-    return NULL;
-}
-
-static void on_pull_clicked(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    char *name = g_strstrip(g_strdup(entry_str(app->pull_entry)));
-    JsonBuilder *jb;
-    JsonNode *root;
-    PullReq *r;
-    char *base;
-
-    (void)b;
-    if (app->pulling) {
-        set_status(app, "A pull is already running");
-        g_free(name);
-        return;
-    }
-    if (!*name) {
-        set_status(app, "Type a model name to pull, e.g. llama3.2:3b");
-        g_free(name);
-        return;
-    }
-
-    jb = json_builder_new();
-    json_builder_begin_object(jb);
-    json_builder_set_member_name(jb, "model");
-    json_builder_add_string_value(jb, name);
-    json_builder_set_member_name(jb, "stream");
-    json_builder_add_boolean_value(jb, TRUE);
-    json_builder_end_object(jb);
-    root = json_builder_get_root(jb);
-    g_object_unref(jb);
-
-    base = base_url(app);
-    r = g_new0(PullReq, 1);
-    r->app = app;
-    r->url = g_strdup_printf("%s/api/pull", base);
-    r->body = node_to_string(root, FALSE);
-    r->auth = auth_header(app);
-    r->pending = g_string_new(NULL);
-    g_free(base);
-    json_node_free(root);
-
-    app->pulling = TRUE;
-    g_atomic_int_set(&app->pull_cancel, 0);
-    gtk_widget_set_sensitive(app->pull_btn, FALSE);
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->pull_bar), 0.0);
-    gtk_label_set_text(GTK_LABEL(app->pull_status), "starting pull…");
-    set_status(app, "Pulling %s…", name);
-    g_free(name);
-
-    g_thread_unref(g_thread_new("ollama-pull", pull_worker, r));
-}
-
-static void on_pull_cancel(GtkButton *b, gpointer data)
-{
-    App *app = data;
-
-    (void)b;
-    g_atomic_int_set(&app->pull_cancel, 1);
-}
-
-/* ------------------------------------------------------------------ */
-/* running the server and signing in, as child processes              */
-/* ------------------------------------------------------------------ */
-
-static void read_next_line(App *app, GDataInputStream *in);
-
-static void on_log_line(GObject *src, GAsyncResult *res, gpointer data)
-{
-    App *app = data;
-    GDataInputStream *in = G_DATA_INPUT_STREAM(src);
-    gsize len = 0;
-    GError *err = NULL;
-    char *line = g_data_input_stream_read_line_finish(in, res, &len, &err);
-
-    if (!line) {
-        g_clear_error(&err);
-        g_object_unref(in);              /* EOF: release our reference */
-        return;
-    }
-    log_append(app, line);
-    log_append(app, "\n");
-    g_free(line);
-    read_next_line(app, in);
-}
-
-static void read_next_line(App *app, GDataInputStream *in)
-{
-    g_data_input_stream_read_line_async(in, G_PRIORITY_DEFAULT, NULL,
-                                        on_log_line, app);
-}
-
-static void watch_output(App *app, GSubprocess *proc)
-{
-    GInputStream *out = g_subprocess_get_stdout_pipe(proc);
-
-    if (out)
-        read_next_line(app, g_data_input_stream_new(out));
-}
-
-static gboolean delayed_probe(gpointer data)
-{
-    App *app = data;
-
-    start_version_probe(app);
-    start_models_load(app);
-    start_inventory_load(app);
-    return G_SOURCE_REMOVE;
-}
-
-static void on_server_exit(GObject *src, GAsyncResult *res, gpointer data)
-{
-    App *app = data;
-    GError *err = NULL;
-
-    if (!g_subprocess_wait_check_finish(G_SUBPROCESS(src), res, &err)) {
-        log_append(app, "[server exited] ");
-        log_append(app, err ? err->message : "unknown reason");
-        log_append(app, "\n");
-        g_clear_error(&err);
-    } else {
-        log_append(app, "[server exited cleanly]\n");
-    }
-    if (app->server_proc == G_SUBPROCESS(src)) {
-        g_object_unref(app->server_proc);
-        app->server_proc = NULL;
-        gtk_widget_set_sensitive(app->serve_btn, TRUE);
-        gtk_widget_set_sensitive(app->serve_stop_btn, FALSE);
-    }
-    start_version_probe(app);
-}
-
-static void on_oneshot_exit(GObject *src, GAsyncResult *res, gpointer data)
-{
-    App *app = data;
-    GError *err = NULL;
-
-    if (!g_subprocess_wait_check_finish(G_SUBPROCESS(src), res, &err)) {
-        log_append(app, "[command failed] ");
-        log_append(app, err ? err->message : "unknown reason");
-        log_append(app, "\n");
-        g_clear_error(&err);
-    } else {
-        log_append(app, "[command finished]\n");
-    }
-    g_object_unref(src);
-    start_version_probe(app);
-}
-
-static GSubprocess *spawn_command(App *app, const char *cmdline, GError **err)
-{
-    char **argv = NULL;
-    int n = 0;
-    GSubprocess *proc;
-
-    if (!g_shell_parse_argv(cmdline, &n, &argv, err))
-        return NULL;
-    proc = g_subprocess_newv((const char *const *)argv,
-                             G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                             G_SUBPROCESS_FLAGS_STDERR_MERGE, err);
-    g_strfreev(argv);
-    if (!proc)
-        return NULL;
-    log_append(app, "$ ");
-    log_append(app, cmdline);
-    log_append(app, "\n");
-    watch_output(app, proc);
-    return proc;
-}
-
-static void on_serve_start(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    GError *err = NULL;
-    GSubprocess *proc;
-
-    (void)b;
-    if (app->server_proc) {
-        set_status(app, "The server was already started from this window");
-        return;
-    }
-    proc = spawn_command(app, entry_str(app->serve_cmd_e), &err);
-    if (!proc) {
-        show_error(app, err ? err->message : "Could not start the server");
-        g_clear_error(&err);
-        return;
-    }
-    app->server_proc = proc;
-    gtk_widget_set_sensitive(app->serve_btn, FALSE);
-    gtk_widget_set_sensitive(app->serve_stop_btn, TRUE);
-    g_subprocess_wait_check_async(proc, NULL, on_server_exit, app);
-    g_timeout_add_seconds(2, delayed_probe, app);
-    set_status(app, "Server starting…");
-}
-
-static void on_serve_stop(GtkButton *b, gpointer data)
-{
-    App *app = data;
-
-    (void)b;
-    if (!app->server_proc) {
-        set_status(app, "No server was started from this window");
-        return;
-    }
-    g_subprocess_send_signal(app->server_proc, SIGTERM);
-    log_append(app, "[SIGTERM sent]\n");
-}
-
-static void on_signin_clicked(GtkButton *b, gpointer data)
-{
-    App *app = data;
-    GError *err = NULL;
-    GSubprocess *proc;
-
-    (void)b;
-    proc = spawn_command(app, entry_str(app->signin_cmd_e), &err);
-    if (!proc) {
-        show_error(app, err ? err->message
-                            : "Could not run the sign-in command");
-        g_clear_error(&err);
-        return;
-    }
-    log_append(app, "[sign-in started: confirm in the browser window that "
-                    "opens, or follow the URL printed above]\n");
-    g_subprocess_wait_check_async(proc, NULL, on_oneshot_exit, app);
+    config_save(app);
+    if (app->worker)
+        g_atomic_int_set(&app->worker->cancel, 1);
+    app->closing = TRUE;
+    return FALSE;                          /* let the window close */
 }
 
 static void on_shutdown(GApplication *gapp, gpointer data)
 {
     App *app = data;
+    int i;
 
     (void)gapp;
-    save_state(app);
-    if (app->server_proc) {
-        g_subprocess_send_signal(app->server_proc, SIGTERM);
-        g_object_unref(app->server_proc);
-        app->server_proc = NULL;
+    for (i = 0; i < PROV_COUNT; i++) {
+        g_free(app->keys[i]);
+        g_free(app->hosts[i]);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* the three new pages                                                */
-/* ------------------------------------------------------------------ */
-
-static GtkWidget *note_label(const char *text)
-{
-    GtkWidget *l = gtk_label_new(text);
-
-    gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
-    gtk_label_set_wrap(GTK_LABEL(l), TRUE);
-    gtk_widget_set_margin_bottom(l, 2);
-    return l;
-}
-
-static GtkWidget *page_box(void)
-{
-    GtkWidget *b = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-
-    gtk_widget_set_margin_start(b, 10);
-    gtk_widget_set_margin_end(b, 10);
-    gtk_widget_set_margin_top(b, 10);
-    gtk_widget_set_margin_bottom(b, 10);
-    return b;
-}
-
-static GtkWidget *page_scroller(GtkWidget *child)
-{
-    GtkWidget *sw = gtk_scrolled_window_new();
-
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
-                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-    gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(sw),
-                                              PANE_LEFT_MIN);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), child);
-    return sw;
-}
-
-static GtkWidget *build_models_page(App *app)
-{
-    GtkWidget *p = page_box();
-    GtkWidget *row, *scr, *btn;
-
-    gtk_box_append(GTK_BOX(p), section_label("Pull a model"));
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Name as it appears in the library, for example llama3.2:3b, or a "
-        "cloud variant such as gpt-oss:120b-cloud (sign in first)."));
-
-    app->pull_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->pull_entry), "llama3.2:3b");
-    gtk_box_append(GTK_BOX(p), app->pull_entry);
-
-    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    app->pull_btn = gtk_button_new_with_label("Pull");
-    gtk_widget_set_hexpand(app->pull_btn, TRUE);
-    g_signal_connect(app->pull_btn, "clicked",
-                     G_CALLBACK(on_pull_clicked), app);
-    btn = gtk_button_new_with_label("Cancel");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_pull_cancel), app);
-    gtk_box_append(GTK_BOX(row), app->pull_btn);
-    gtk_box_append(GTK_BOX(row), btn);
-    gtk_box_append(GTK_BOX(p), row);
-
-    app->pull_bar = gtk_progress_bar_new();
-    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(app->pull_bar), TRUE);
-    gtk_box_append(GTK_BOX(p), app->pull_bar);
-    app->pull_status = note_label("idle");
-    gtk_box_append(GTK_BOX(p), app->pull_status);
-
-    gtk_box_append(GTK_BOX(p), section_label("Installed models"));
-    btn = gtk_button_new_with_label("Refresh list");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_refresh_all), app);
-    gtk_box_append(GTK_BOX(p), btn);
-
-    scr = ro_text_area(&app->models_buf, FALSE, TRUE, 240);
-    gtk_text_buffer_set_text(app->models_buf, "(loading…)", -1);
-    gtk_widget_set_vexpand(scr, TRUE);
-    gtk_box_append(GTK_BOX(p), scr);
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Choose the one to use from the Model list on the Request page; that "
-        "list is rebuilt after every pull."));
-
-    return page_scroller(p);
-}
-
-static GtkWidget *build_server_page(App *app)
-{
-    GtkWidget *p = page_box();
-    GtkWidget *row, *scr, *btn;
-
-    gtk_box_append(GTK_BOX(p), section_label("Local server"));
-    app->version_label = note_label("server: unknown");
-    gtk_box_append(GTK_BOX(p), app->version_label);
-
-    app->serve_cmd_e = gtk_entry_new();
-    gtk_editable_set_text(GTK_EDITABLE(app->serve_cmd_e), app->cfg_serve_cmd);
-    gtk_box_append(GTK_BOX(p), prop_row("Start cmd", app->serve_cmd_e));
-
-    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    app->serve_btn = gtk_button_new_with_label("Start server");
-    gtk_widget_set_hexpand(app->serve_btn, TRUE);
-    g_signal_connect(app->serve_btn, "clicked", G_CALLBACK(on_serve_start), app);
-    app->serve_stop_btn = gtk_button_new_with_label("Stop");
-    gtk_widget_set_sensitive(app->serve_stop_btn, FALSE);
-    g_signal_connect(app->serve_stop_btn, "clicked",
-                     G_CALLBACK(on_serve_stop), app);
-    btn = gtk_button_new_with_label("Check");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_probe_clicked), app);
-    gtk_box_append(GTK_BOX(row), app->serve_btn);
-    gtk_box_append(GTK_BOX(row), app->serve_stop_btn);
-    gtk_box_append(GTK_BOX(row), btn);
-    gtk_box_append(GTK_BOX(p), row);
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Stop affects only a server started from this window; a "
-        "systemd-managed instance keeps running."));
-
-    gtk_box_append(GTK_BOX(p), section_label("Sign in"));
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Sign-in registers this machine's key with your ollama.com account, "
-        "which cloud models require. The command opens a browser; the URL "
-        "also appears in the log below."));
-    app->signin_cmd_e = gtk_entry_new();
-    gtk_editable_set_text(GTK_EDITABLE(app->signin_cmd_e), app->cfg_signin_cmd);
-    gtk_box_append(GTK_BOX(p), prop_row("Command", app->signin_cmd_e));
-    btn = gtk_button_new_with_label("Run sign-in");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_signin_clicked), app);
-    gtk_box_append(GTK_BOX(p), btn);
-
-    gtk_box_append(GTK_BOX(p), section_label("API key"));
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Sent as an Authorization: Bearer header. Needed only when talking "
-        "straight to https://ollama.com; a local server signs its own cloud "
-        "requests."));
-    app->apikey_entry = gtk_entry_new();
-    gtk_entry_set_visibility(GTK_ENTRY(app->apikey_entry), FALSE);
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->apikey_entry),
-                                   "taken from OLLAMA_API_KEY if set");
-    if (app->cfg_key && *app->cfg_key)
-        gtk_editable_set_text(GTK_EDITABLE(app->apikey_entry), app->cfg_key);
-    gtk_box_append(GTK_BOX(p), app->apikey_entry);
-    app->remember_key_cb = gtk_check_button_new_with_label(
-        "Store the key in the config file (plain text, mode 0600)");
-    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->remember_key_cb),
-                                app->cfg_remember_key);
-    gtk_box_append(GTK_BOX(p), app->remember_key_cb);
-
-    gtk_box_append(GTK_BOX(p), section_label("Log"));
-    scr = ro_text_area(&app->log_buf, FALSE, TRUE, 180);
-    gtk_widget_set_vexpand(scr, TRUE);
-    gtk_box_append(GTK_BOX(p), scr);
-
-    return page_scroller(p);
-}
-
-static GtkWidget *build_usage_page(App *app)
-{
-    GtkWidget *p = page_box();
-    GtkWidget *row, *scr, *btn;
-
-    gtk_box_append(GTK_BOX(p), section_label("Token ledger"));
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Ollama reports prompt_eval_count and eval_count per request but "
-        "exposes no account quota endpoint, so this page is a local tally "
-        "priced with the rates you enter. It is an estimate, not your "
-        "account balance."));
-
-    app->price_in_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->price_in_e), "0.00");
-    gtk_editable_set_text(GTK_EDITABLE(app->price_in_e), app->cfg_price_in);
-    gtk_box_append(GTK_BOX(p), prop_row("in / 1M tok", app->price_in_e));
-
-    app->price_out_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->price_out_e), "0.00");
-    gtk_editable_set_text(GTK_EDITABLE(app->price_out_e), app->cfg_price_out);
-    gtk_box_append(GTK_BOX(p), prop_row("out / 1M tok", app->price_out_e));
-
-    app->budget_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->budget_e), "0.00");
-    gtk_editable_set_text(GTK_EDITABLE(app->budget_e), app->cfg_budget);
-    gtk_box_append(GTK_BOX(p), prop_row("budget", app->budget_e));
-
-    app->currency_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->currency_e), "USD");
-    gtk_editable_set_text(GTK_EDITABLE(app->currency_e), app->cfg_currency);
-    gtk_box_append(GTK_BOX(p), prop_row("currency", app->currency_e));
-
-    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    btn = gtk_button_new_with_label("Apply");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_usage_apply), app);
-    gtk_box_append(GTK_BOX(row), btn);
-    btn = gtk_button_new_with_label("Reset period");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_usage_reset), app);
-    gtk_box_append(GTK_BOX(row), btn);
-    btn = gtk_button_new_with_label("Save table…");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_save_usage), app);
-    gtk_box_append(GTK_BOX(row), btn);
-    gtk_box_append(GTK_BOX(p), row);
-
-    app->usage_summary = note_label("");
-    gtk_box_append(GTK_BOX(p), app->usage_summary);
-
-    scr = ro_text_area(&app->usage_buf, FALSE, TRUE, 240);
-    gtk_widget_set_vexpand(scr, TRUE);
-    gtk_box_append(GTK_BOX(p), scr);
-
-    gtk_box_append(GTK_BOX(p), note_label(
-        "Models tagged -cloud or :cloud, and anything sent to ollama.com, "
-        "count as billed. Everything else is local and tallied separately."));
-
-    return page_scroller(p);
-}
-
-/* Wrap the existing request builder and the three new pages in a stack. */
-static GtkWidget *build_left_pane(App *app, GtkWidget *request_page)
-{
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    GtkWidget *stack = gtk_stack_new();
-    GtkWidget *switcher = gtk_stack_switcher_new();
-
-    gtk_stack_set_transition_type(GTK_STACK(stack),
-                                  GTK_STACK_TRANSITION_TYPE_NONE);
-    gtk_stack_add_titled(GTK_STACK(stack), request_page, "request", "Request");
-    gtk_stack_add_titled(GTK_STACK(stack), build_models_page(app),
-                         "models", "Models");
-    gtk_stack_add_titled(GTK_STACK(stack), build_server_page(app),
-                         "server", "Server");
-    gtk_stack_add_titled(GTK_STACK(stack), build_usage_page(app),
-                         "usage", "Usage");
-    gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(switcher), GTK_STACK(stack));
-
-    gtk_widget_set_margin_top(switcher, 6);
-    gtk_widget_set_vexpand(stack, TRUE);
-    gtk_box_append(GTK_BOX(box), switcher);
-    gtk_box_append(GTK_BOX(box), stack);
-    return box;
-}
-
-/* ------------------------------------------------------------------ */
-/* UI construction                                                    */
-/* ------------------------------------------------------------------ */
-
-static GtkWidget *section_label(const char *text)
-{
-    GtkWidget *l = gtk_label_new(NULL);
-    char *markup = g_strdup_printf("<b>%s</b>", text);
-
-    gtk_label_set_markup(GTK_LABEL(l), markup);
-    gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
-    g_free(markup);
-    return l;
-}
-
-static GtkWidget *prop_row(const char *label, GtkWidget *w)
-{
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *l = gtk_label_new(label);
-
-    gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
-    gtk_widget_set_size_request(l, 86, -1);
-    gtk_widget_set_hexpand(w, TRUE);
-    gtk_box_append(GTK_BOX(row), l);
-    gtk_box_append(GTK_BOX(row), w);
-    return row;
-}
-
-static GtkWidget *make_text_area(GtkTextBuffer **buf_out, gboolean wrap,
-                                 gboolean mono, int min_h)
-{
-    GtkWidget *view = gtk_text_view_new();
-    GtkWidget *scr = gtk_scrolled_window_new();
-
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view),
-                                wrap ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
-    gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), mono);
-    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(view), 6);
-    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(view), 6);
-    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(view), 6);
-    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(view), 6);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scr), view);
-    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scr), min_h);
-    *buf_out = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
-    return scr;
-}
-
-static gboolean set_initial_split(gpointer data)
-{
-    App *app = data;
-
-    gtk_paned_set_position(GTK_PANED(app->paned), 390);
-    return G_SOURCE_REMOVE;
-}
-
-static void activate(GtkApplication *gapp, gpointer user_data)
+static void activate(GtkApplication *gtkapp, gpointer user)
 {
     App *app = g_new0(App, 1);
-    GtkWidget *win, *top, *split, *left_sw, *left, *chat_sw, *bottom;
-    GtkWidget *host_box, *refresh_btn, *grid, *toggles, *att_row;
-    GtkWidget *attach_btn, *clear_att_btn, *scr, *btn_row, *spacer, *st_row;
-    GtkWidget *preview_btn, *copy_btn, *save_btn, *new_btn;
-    GtkEventController *motion, *keys;
-    GtkTextIter e;
+    GtkWidget *win, *paned, *left_sw, *left, *right;
+    int i;
 
-    (void)user_data;
-
+    (void)user;
+    app->history = g_ptr_array_new_with_free_func(msg_free);
     app->models = g_ptr_array_new_with_free_func(g_free);
-    app->attachments = g_ptr_array_new_with_free_func(attachment_free);
-    app->messages = json_array_new();
-    app->usage = g_ptr_array_new_with_free_func(usage_free);
-    app->think_blocks = g_ptr_array_new_with_free_func(think_block_free);
-    load_state(app);                    /* features 4-6: config + ledger */
+    app->reply_acc = g_string_new(NULL);
+    app->att = g_ptr_array_new_with_free_func(attachment_free);
+    app->quirks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    for (i = 0; i < PROV_COUNT; i++) {
+        app->keys[i] = NULL;
+        app->hosts[i] = NULL;
+    }
+    config_load(app);
 
-    win = gtk_application_window_new(gapp);
+    win = gtk_application_window_new(gtkapp);
     app->win = GTK_WINDOW(win);
-    gtk_window_set_title(GTK_WINDOW(win), "Ollama GUI");
-    gtk_window_set_default_size(GTK_WINDOW(win), 1180, 780);
+    gtk_window_set_title(app->win,
+                         "ollama-gui — Ollama · OpenAI · Anthropic · Gemini");
+    gtk_window_set_default_size(app->win, 1150, 780);
 
-    top = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_window_set_child(GTK_WINDOW(win), top);
-
-    /* -------- left panel (request builder) -------- */
-
-    left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_margin_start(left, 10);
-    gtk_widget_set_margin_end(left, 10);
-    gtk_widget_set_margin_top(left, 10);
-    gtk_widget_set_margin_bottom(left, 10);
-
-    gtk_box_append(GTK_BOX(left), section_label("Connection"));
-
-    app->host_entry = gtk_entry_new();
-    gtk_editable_set_text(GTK_EDITABLE(app->host_entry), app->cfg_host);
-    gtk_widget_set_hexpand(app->host_entry, TRUE);
-    refresh_btn = gtk_button_new_with_label("⟳");
-    gtk_widget_set_tooltip_text(refresh_btn, "Load model list from /api/tags");
-    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_all), app);
-    host_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_append(GTK_BOX(host_box), app->host_entry);
-    gtk_box_append(GTK_BOX(host_box), refresh_btn);
-    gtk_box_append(GTK_BOX(left), prop_row("Host", host_box));
-
-    /* placeholder until the real list arrives */
-    {
-        const char *const init[] = { "(press ⟳ to load)", NULL };
-
-        app->model_list = gtk_string_list_new(init);
-    }
-    app->model_dd = gtk_drop_down_new(G_LIST_MODEL(app->model_list), NULL);
-    gtk_box_append(GTK_BOX(left), prop_row("Model", app->model_dd));
-
-    app->endpoint_dd = gtk_drop_down_new_from_strings(ENDPOINTS);
-    gtk_box_append(GTK_BOX(left), prop_row("Endpoint", app->endpoint_dd));
-
-    gtk_box_append(GTK_BOX(left), section_label("System prompt"));
-    scr = make_text_area(&app->sys_buf, TRUE, FALSE, 90);
-    gtk_box_append(GTK_BOX(left), scr);
-
-    gtk_box_append(GTK_BOX(left), section_label("Output"));
-    app->format_dd = gtk_drop_down_new_from_strings(OUT_MODES);
-    gtk_box_append(GTK_BOX(left), prop_row("Format", app->format_dd));
-    gtk_box_append(GTK_BOX(left),
-                   section_label("JSON schema (for format = JSON schema)"));
-    scr = make_text_area(&app->schema_buf, FALSE, TRUE, 100);
-    gtk_box_append(GTK_BOX(left), scr);
-
-    gtk_box_append(GTK_BOX(left), section_label("Generation options"));
-
-    app->temp_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->temp_e), "e.g. 0.8");
-    app->topp_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->topp_e), "e.g. 0.9");
-    app->ctx_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->ctx_e), "e.g. 4096");
-    app->npred_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->npred_e), "e.g. 512 (-1 = ∞)");
-    app->seed_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->seed_e), "e.g. 42");
-    app->keep_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->keep_e), "e.g. 5m");
-    app->limit_e = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->limit_e), "20000");
-
-    grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 6);
-#define GRID_PAIR(row, col, lab, entry)                                     \
-    do {                                                                    \
-        GtkWidget *l = gtk_label_new(lab);                                  \
-        gtk_label_set_xalign(GTK_LABEL(l), 0.0f);                           \
-        gtk_widget_set_hexpand(entry, TRUE);                                \
-        gtk_grid_attach(GTK_GRID(grid), l, (col), (row), 1, 1);             \
-        gtk_grid_attach(GTK_GRID(grid), entry, (col) + 1, (row), 1, 1);     \
-    } while (0)
-    GRID_PAIR(0, 0, "temperature", app->temp_e);
-    GRID_PAIR(0, 2, "top_p", app->topp_e);
-    GRID_PAIR(1, 0, "num_ctx", app->ctx_e);
-    GRID_PAIR(1, 2, "num_predict", app->npred_e);
-    GRID_PAIR(2, 0, "seed", app->seed_e);
-    GRID_PAIR(2, 2, "keep_alive", app->keep_e);
-    GRID_PAIR(3, 0, "char limit", app->limit_e);
-#undef GRID_PAIR
-    gtk_box_append(GTK_BOX(left), grid);
-
-    gtk_box_append(GTK_BOX(left), section_label("Toggles"));
-
-    toggles = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    app->stream_cb = gtk_check_button_new_with_label("Stream responses");
-    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->stream_cb), TRUE);
-    app->think_cb = gtk_check_button_new_with_label("Enable thinking");
-    app->hist_cb = gtk_check_button_new_with_label("Send chat history");
-    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->hist_cb), TRUE);
-    app->ground_cb = gtk_check_button_new_with_label(
-        "Also ground schema in the prompt");
-    app->ptr_cb = gtk_check_button_new_with_label(
-        "Split follows mouse pointer");
-    gtk_widget_set_tooltip_text(app->ptr_cb,
-        "Move the pointer left/right across the window to steer the "
-        "divider between the settings and the chat");
-    app->colour_cb = gtk_check_button_new_with_label("Colour");
-    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->colour_cb), TRUE);
-    gtk_widget_set_tooltip_text(app->colour_cb,
-        "Colourful markdown rendering of the answers");
-    g_signal_connect(app->colour_cb, "toggled",
-                     G_CALLBACK(on_colour_toggled), app);
-
-    gtk_box_append(GTK_BOX(toggles), app->stream_cb);
-    gtk_box_append(GTK_BOX(toggles), app->think_cb);
-    gtk_box_append(GTK_BOX(toggles), app->hist_cb);
-    gtk_box_append(GTK_BOX(toggles), app->ground_cb);
-    gtk_box_append(GTK_BOX(toggles), app->ptr_cb);
-    gtk_box_append(GTK_BOX(toggles), app->colour_cb);
-    gtk_box_append(GTK_BOX(left), toggles);
-
-    gtk_box_append(GTK_BOX(left), section_label("Attachments"));
-
-    app->loadmode_dd = gtk_drop_down_new_from_strings(LOAD_MODES);
-    gtk_widget_set_hexpand(app->loadmode_dd, TRUE);
-    attach_btn = gtk_button_new_with_label("Attach…");
-    g_signal_connect(attach_btn, "clicked", G_CALLBACK(on_attach_files), app);
-    clear_att_btn = gtk_button_new_with_label("Clear");
-    g_signal_connect(clear_att_btn, "clicked", G_CALLBACK(on_clear_attach), app);
-    att_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_append(GTK_BOX(att_row), app->loadmode_dd);
-    gtk_box_append(GTK_BOX(att_row), attach_btn);
-    gtk_box_append(GTK_BOX(att_row), clear_att_btn);
-    gtk_box_append(GTK_BOX(left), att_row);
-
-    scr = make_text_area(&app->attach_buf, FALSE, TRUE, 64);
-    {
-        /* the view inside `scr` should be read-only */
-        GtkWidget *v = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(scr));
-
-        gtk_text_view_set_editable(GTK_TEXT_VIEW(v), FALSE);
-    }
-    gtk_box_append(GTK_BOX(left), scr);
-    refresh_attachment_list(app);
+    paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_set_position(GTK_PANED(paned), 400);
 
     left_sw = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(left_sw),
-                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-    gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(left_sw),
-                                              PANE_LEFT_MIN);
+                                    GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(left_sw, 340, -1);
+    left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    margins(left, 8);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(left_sw), left);
+    gtk_paned_set_start_child(GTK_PANED(paned), left_sw);
 
-    /* -------- chat transcript -------- */
+    right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    margins(right, 8);
+    gtk_paned_set_end_child(GTK_PANED(paned), right);
 
-    app->chat_view = gtk_text_view_new();
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(app->chat_view), FALSE);
-    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(app->chat_view), FALSE);
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(app->chat_view),
-                                GTK_WRAP_WORD_CHAR);
-    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(app->chat_view), 8);
-    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(app->chat_view), 8);
-    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(app->chat_view), 8);
-    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(app->chat_view), 8);
-    gtk_widget_set_vexpand(app->chat_view, TRUE);
-    gtk_widget_set_hexpand(app->chat_view, TRUE);
-    app->chat_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(app->chat_view));
-    gtk_text_buffer_get_end_iter(app->chat_buf, &e);
-    app->end_mark = gtk_text_buffer_create_mark(app->chat_buf, NULL, &e, FALSE);
-    gtk_text_buffer_set_text(app->chat_buf,
-        "Pick a model on the left, type below, press Send (or Ctrl+Enter).\n",
-        -1);
+    load_css();
+    build_settings_pane(app, left);
+    build_chat_pane(app, right);
 
-    /* click a "thinking" header to expand/collapse it */
-    {
-        GtkGesture *click = gtk_gesture_click_new();
+    gtk_window_set_child(app->win, paned);
+    gtk_window_present(app->win);
 
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click),
-                                      GDK_BUTTON_PRIMARY);
-        g_signal_connect(click, "released", G_CALLBACK(on_chat_click), app);
-        gtk_widget_add_controller(app->chat_view,
-                                  GTK_EVENT_CONTROLLER(click));
-    }
+    apply_config(app);
+    chat_note(app,
+        "Pick a provider, paste its API key, load models, then send "
+        "(Ctrl+Enter sends). Attach… adds images or text files to the "
+        "next message.", FALSE);
 
-    chat_sw = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(chat_sw, TRUE);
-    gtk_widget_set_hexpand(chat_sw, TRUE);
-    gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(chat_sw),
-                                              PANE_RIGHT_MIN);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(chat_sw), app->chat_view);
-
-    /* -------- paned split + pointer steering -------- */
-
-    split = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-    app->paned = split;
-    gtk_paned_set_wide_handle(GTK_PANED(split), TRUE);
-    gtk_paned_set_resize_start_child(GTK_PANED(split), FALSE);
-    gtk_paned_set_resize_end_child(GTK_PANED(split), TRUE);
-    gtk_paned_set_shrink_start_child(GTK_PANED(split), FALSE);
-    gtk_paned_set_shrink_end_child(GTK_PANED(split), FALSE);
-    gtk_paned_set_start_child(GTK_PANED(split), build_left_pane(app, left_sw));
-    gtk_paned_set_end_child(GTK_PANED(split), chat_sw);
-    gtk_widget_set_vexpand(split, TRUE);
-    gtk_widget_set_hexpand(split, TRUE);
-
-    motion = gtk_event_controller_motion_new();
-    g_signal_connect(motion, "motion", G_CALLBACK(on_root_motion), app);
-    gtk_widget_add_controller(split, motion);
-
-    gtk_box_append(GTK_BOX(top), split);
-
-    /* -------- composer -------- */
-
-    bottom = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(bottom, 8);
-    gtk_widget_set_margin_end(bottom, 8);
-    gtk_widget_set_margin_top(bottom, 6);
-    gtk_widget_set_margin_bottom(bottom, 8);
-
-    scr = make_text_area(&app->input_buf, TRUE, FALSE, 80);
-    {
-        GtkWidget *v = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(scr));
-
-        keys = gtk_event_controller_key_new();
-        g_signal_connect(keys, "key-pressed", G_CALLBACK(on_input_key), app);
-        gtk_widget_add_controller(v, keys);
-    }
-    gtk_box_append(GTK_BOX(bottom), scr);
-
-    btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-
-    app->send_btn = gtk_button_new_with_label("Send");
-    gtk_widget_add_css_class(app->send_btn, "suggested-action");
-    g_signal_connect(app->send_btn, "clicked", G_CALLBACK(on_send), app);
-    app->stop_btn = gtk_button_new_with_label("Stop");
-    gtk_widget_add_css_class(app->stop_btn, "destructive-action");
-    gtk_widget_set_sensitive(app->stop_btn, FALSE);
-    g_signal_connect(app->stop_btn, "clicked", G_CALLBACK(on_stop), app);
-    preview_btn = gtk_button_new_with_label("Preview request");
-    g_signal_connect(preview_btn, "clicked", G_CALLBACK(on_preview), app);
-
-    spacer = gtk_label_new("");
-    gtk_widget_set_hexpand(spacer, TRUE);
-
-    /* buttons */
-    app->code_btn = gtk_button_new_with_label("Extract code…");
-    gtk_widget_set_tooltip_text(app->code_btn,
-        "Save every fenced code/script block of the last reply to files");
-    g_signal_connect(app->code_btn, "clicked", G_CALLBACK(on_extract_code), app);
-    app->points_btn = gtk_button_new_with_label("Extract points…");
-    gtk_widget_set_tooltip_text(app->points_btn,
-        "Save the headings and bullet points of the last reply to a markdown file");
-    g_signal_connect(app->points_btn, "clicked",
-                     G_CALLBACK(on_extract_points), app);
-
-    copy_btn = gtk_button_new_with_label("Copy reply");
-    g_signal_connect(copy_btn, "clicked", G_CALLBACK(on_copy_reply), app);
-    app->save_sel_btn = gtk_button_new_with_label("Save selection…");
-    gtk_widget_set_tooltip_text(app->save_sel_btn,
-        "Save the text currently selected in the chat to a file");
-    gtk_widget_set_sensitive(app->save_sel_btn, FALSE);
-    g_signal_connect(app->save_sel_btn, "clicked",
-                     G_CALLBACK(on_save_selection), app);
-    g_signal_connect(app->chat_buf, "notify::has-selection",
-                     G_CALLBACK(on_chat_selection_changed), app);
-    save_btn = gtk_button_new_with_label("Save chat…");
-    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_save_chat), app);
-    new_btn = gtk_button_new_with_label("New chat");
-    g_signal_connect(new_btn, "clicked", G_CALLBACK(on_new_chat), app);
-
-    gtk_box_append(GTK_BOX(btn_row), app->send_btn);
-    gtk_box_append(GTK_BOX(btn_row), app->stop_btn);
-    gtk_box_append(GTK_BOX(btn_row), preview_btn);
-    gtk_box_append(GTK_BOX(btn_row), spacer);
-    gtk_box_append(GTK_BOX(btn_row), app->code_btn);
-    gtk_box_append(GTK_BOX(btn_row), app->points_btn);
-    gtk_box_append(GTK_BOX(btn_row), copy_btn);
-    gtk_box_append(GTK_BOX(btn_row), app->save_sel_btn);
-    gtk_box_append(GTK_BOX(btn_row), save_btn);
-    gtk_box_append(GTK_BOX(btn_row), new_btn);
-    gtk_box_append(GTK_BOX(bottom), btn_row);
-
-    st_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    app->spinner = gtk_spinner_new();
-    app->status = gtk_label_new("Ready");
-    gtk_label_set_xalign(GTK_LABEL(app->status), 0.0f);
-    gtk_label_set_ellipsize(GTK_LABEL(app->status), PANGO_ELLIPSIZE_END);
-    gtk_widget_set_hexpand(app->status, TRUE);
-    gtk_box_append(GTK_BOX(st_row), app->spinner);
-    gtk_box_append(GTK_BOX(st_row), app->status);
-    gtk_box_append(GTK_BOX(bottom), st_row);
-
-    gtk_box_append(GTK_BOX(top), bottom);
-
-    gtk_window_set_default_widget(GTK_WINDOW(win), app->send_btn);
-    gtk_window_present(GTK_WINDOW(win));
-
-    /* initial divider position, once the window has a real width */
-    g_idle_add(set_initial_split, app);
-
-    /* fetch the model list right away */
-    start_models_load(app);
-
-    /* features 4-6: server state, inventory, ledger, and save on exit */
-    start_version_probe(app);
-    start_inventory_load(app);
-    render_usage(app);
-    g_signal_connect(gapp, "shutdown", G_CALLBACK(on_shutdown), app);
+    g_signal_connect(win, "close-request", G_CALLBACK(on_close_request), app);
+    g_signal_connect(gtkapp, "shutdown", G_CALLBACK(on_shutdown), app);
 }
 
 int main(int argc, char **argv)
 {
-    GtkApplication *gapp;
+    GtkApplication *gtkapp;
     int status;
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    gapp = gtk_application_new("com.example.OllamaGui",
-                               G_APPLICATION_DEFAULT_FLAGS);
-    g_signal_connect(gapp, "activate", G_CALLBACK(activate), NULL);
-    status = g_application_run(G_APPLICATION(gapp), argc, argv);
-    g_object_unref(gapp);
+    curl_global_init(CURL_GLOBAL_DEFAULT);   /* not thread-safe if implicit */
+    gtkapp = gtk_application_new("org.example.cloudchat", APP_FLAGS);
+    g_signal_connect(gtkapp, "activate", G_CALLBACK(activate), NULL);
+    status = g_application_run(G_APPLICATION(gtkapp), argc, argv);
+    g_object_unref(gtkapp);
     curl_global_cleanup();
     return status;
 }
