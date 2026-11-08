@@ -53,6 +53,10 @@
 /* bytes of a streamed body kept for HTTP error reports */
 #define ERR_BODY_CAP (64 * 1024)
 
+/* edge zone (px) and max speed (px/tick) for drag-select auto-scroll */
+#define AUTO_SCROLL_EDGE  48.0
+#define AUTO_SCROLL_SPEED 28.0
+
 /* ================================================================== */
 /*  provider table                                                    */
 /* ================================================================== */
@@ -1392,9 +1396,13 @@ struct App {
     GtkTextBuffer *sys_buf;
 
     /* chat */
+    GtkWidget     *chat_sw;           /* scrolled window holding chat_box */
     GtkWidget     *chat_box;          /* vertical list of bubbles */
     GtkAdjustment *chat_adj;
     gboolean       follow;            /* keep the view pinned to the end */
+    guint          drag_scroll_id;    /* timer for mouse-select auto-scroll */
+    double         drag_scroll_step;  /* px per tick (+down / -up) */
+    double         drag_x, drag_y;    /* last pointer pos in chat_sw coords */
     GtkTextBuffer *input_buf;
     GtkWidget     *send_btn, *stop_btn, *spinner, *status;
 
@@ -1454,6 +1462,7 @@ static const char CHAT_CSS[] =
     "  border-radius: 14px 14px 4px 14px; padding: 8px 12px; }\n"
     ".bubble-asst { background-color: alpha(#808080, 0.12);"
     "  border-radius: 14px 14px 14px 4px; padding: 8px 12px; }\n"
+    ".bubble-user textview, .bubble-user textview text,"
     ".bubble-asst textview, .bubble-asst textview text"
     "  { background-color: transparent; }\n"
     ".think-toggle { padding: 1px 8px; min-height: 0; font-size: smaller; }\n"
@@ -1504,6 +1513,120 @@ static void chat_follow(App *app)
                              gtk_adjustment_get_page_size(app->chat_adj));
 }
 
+/* ------------------------------------------------------------------ */
+/*  mouse drag-selection auto-scroll                                  */
+/* ------------------------------------------------------------------ */
+
+static void drag_scroll_stop(App *app)
+{
+    if (app->drag_scroll_id) {
+        g_source_remove(app->drag_scroll_id);
+        app->drag_scroll_id = 0;
+    }
+    app->drag_scroll_step = 0.0;
+}
+
+/* As the outer scrolled window scrolls under a stationary mouse cursor,
+ * extend the active bubble's text selection to the new character under
+ * the pointer. */
+static void extend_selection_at_pointer(App *app)
+{
+    GtkWidget *focus;
+    graphene_point_t pt, tv_pt;
+    GtkTextView *tv;
+    GtkTextBuffer *buf;
+    GtkTextIter iter;
+    int bx, by;
+
+    if (!app->win || !app->chat_sw)
+        return;
+    focus = gtk_window_get_focus(app->win);
+    if (!focus)
+        return;
+    if (!GTK_IS_TEXT_VIEW(focus))
+        focus = gtk_widget_get_ancestor(focus, GTK_TYPE_TEXT_VIEW);
+    if (!focus || !gtk_widget_is_ancestor(focus, app->chat_box))
+        return;
+
+    pt = GRAPHENE_POINT_INIT((float)app->drag_x, (float)app->drag_y);
+    if (!gtk_widget_compute_point(app->chat_sw, focus, &pt, &tv_pt))
+        return;
+
+    tv = GTK_TEXT_VIEW(focus);
+    gtk_text_view_window_to_buffer_coords(tv, GTK_TEXT_WINDOW_WIDGET,
+                                          (int)tv_pt.x, (int)tv_pt.y,
+                                          &bx, &by);
+    gtk_text_view_get_iter_at_location(tv, &iter, bx, by);
+    buf = gtk_text_view_get_buffer(tv);
+    gtk_text_buffer_move_mark_by_name(buf, "insert", &iter);
+}
+
+static gboolean drag_scroll_tick(gpointer data)
+{
+    App *app = data;
+    GtkAdjustment *a = app->chat_adj;
+    double val, lo, hi, nv;
+
+    if (app->closing || app->drag_scroll_step == 0.0) {
+        app->drag_scroll_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+    val = gtk_adjustment_get_value(a);
+    lo  = gtk_adjustment_get_lower(a);
+    hi  = MAX(lo, gtk_adjustment_get_upper(a) - gtk_adjustment_get_page_size(a));
+    nv  = CLAMP(val + app->drag_scroll_step, lo, hi);
+    if (nv != val) {
+        gtk_adjustment_set_value(a, nv);
+        extend_selection_at_pointer(app);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_chat_motion(GtkEventControllerMotion *ctrl,
+                           double x, double y, gpointer data)
+{
+    App *app = data;
+    GdkEvent *ev = gtk_event_controller_get_current_event(
+                       GTK_EVENT_CONTROLLER(ctrl));
+    GdkModifierType state = ev ? gdk_event_get_modifier_state(ev) : 0;
+    double h, step = 0.0;
+
+    if (!(state & GDK_BUTTON1_MASK)) {
+        drag_scroll_stop(app);
+        return;
+    }
+
+    app->drag_x = x;
+    app->drag_y = y;
+    h = (double)gtk_widget_get_height(app->chat_sw);
+    if (h <= 0.0)
+        return;
+
+    if (y > h - AUTO_SCROLL_EDGE) {
+        double d = (y - (h - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE;
+        step = AUTO_SCROLL_SPEED * CLAMP(d, 0.05, 2.5);
+    } else if (y < AUTO_SCROLL_EDGE) {
+        double d = (AUTO_SCROLL_EDGE - y) / AUTO_SCROLL_EDGE;
+        step = -AUTO_SCROLL_SPEED * CLAMP(d, 0.05, 2.5);
+    }
+
+    app->drag_scroll_step = step;
+    if (step != 0.0 && !app->drag_scroll_id)
+        app->drag_scroll_id = g_timeout_add(16, drag_scroll_tick, app);
+    else if (step == 0.0)
+        drag_scroll_stop(app);
+}
+
+static void on_chat_btn_released(GtkGestureClick *g, int n_press,
+                                 double x, double y, gpointer data)
+{
+    (void)g;
+    (void)n_press;
+    (void)x;
+    (void)y;
+    drag_scroll_stop((App *)data);
+}
+
 static void chat_add(App *app, GtkWidget *w)
 {
     gtk_box_append(GTK_BOX(app->chat_box), w);
@@ -1514,6 +1637,7 @@ static void chat_clear(App *app)
 {
     GtkWidget *c;
 
+    drag_scroll_stop(app);
     while ((c = gtk_widget_get_first_child(app->chat_box)) != NULL)
         gtk_box_remove(GTK_BOX(app->chat_box), c);
     app->cur_box = NULL;
@@ -1531,6 +1655,21 @@ static GtkWidget *wrap_label(const char *text)
     return l;
 }
 
+static GtkWidget *bubble_text_view(GtkTextBuffer **buf, const char *css)
+{
+    GtkWidget *tv = gtk_text_view_new();
+    GtkTextBuffer *b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
+
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(tv), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
+    if (css)
+        gtk_widget_add_css_class(tv, css);
+    if (buf)
+        *buf = b;
+    return tv;
+}
+
 /* status / error lines inside the transcript */
 static void chat_note(App *app, const char *text, gboolean error)
 {
@@ -1542,7 +1681,7 @@ static void chat_note(App *app, const char *text, gboolean error)
     chat_add(app, l);
 }
 
-/* your turn: right-aligned bubble hugging its text */
+/* your turn: right-aligned bubble using GtkTextView for smooth mouse selection */
 static void chat_add_user(App *app, const char *text, GPtrArray *att)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -1552,10 +1691,11 @@ static void chat_add_user(App *app, const char *text, GPtrArray *att)
     gtk_widget_set_halign(box, GTK_ALIGN_END);
     gtk_widget_set_margin_start(box, 64);
     if (text && *text) {
-        GtkWidget *l = wrap_label(text);
+        GtkTextBuffer *b = NULL;
+        GtkWidget *tv = bubble_text_view(&b, NULL);
 
-        gtk_label_set_max_width_chars(GTK_LABEL(l), 72);
-        gtk_box_append(GTK_BOX(box), l);
+        gtk_text_buffer_set_text(b, text, -1);
+        gtk_box_append(GTK_BOX(box), tv);
     }
     if (att && att->len) {
         GString *s = g_string_new(NULL);
@@ -1573,19 +1713,6 @@ static void chat_add_user(App *app, const char *text, GPtrArray *att)
     chat_add(app, box);
 }
 
-static GtkWidget *bubble_text_view(GtkTextBuffer **buf, const char *css)
-{
-    GtkWidget *tv = gtk_text_view_new();
-
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
-    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(tv), FALSE);
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
-    if (css)
-        gtk_widget_add_css_class(tv, css);
-    *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
-    return tv;
-}
-
 /* reply: left-aligned bubble, full width minus a right gutter */
 static void asst_begin(App *app)
 {
@@ -1600,6 +1727,7 @@ static void asst_begin(App *app)
     gtk_widget_add_css_class(cap, "caption");
     gtk_widget_add_css_class(cap, "dim-label");
     gtk_widget_set_halign(cap, GTK_ALIGN_START);
+    gtk_label_set_selectable(GTK_LABEL(cap), TRUE);
     gtk_box_append(GTK_BOX(box), cap);
     app->cur_box = box;
     chat_add(app, box);
@@ -2082,8 +2210,8 @@ static void sync_system(App *app)
 /*  attachments                                                       */
 /* ================================================================== */
 
-#define ATT_IMG_MAX (20u * 1024 * 1024)   /* raw bytes per image     */
-#define ATT_TXT_MAX (1024u * 1024)        /* bytes per text file     */
+#define ATT_IMG_MAX ((gsize)100u * 1024u * 1024u)   /* 100 MiB per image     */
+#define ATT_TXT_MAX ((gsize)64u  * 1024u * 1024u)   /* 64 MiB per text file  */
 
 static void attachment_free(gpointer p)
 {
@@ -2114,14 +2242,15 @@ static Attachment *attachment_load(GFile *f, char **why)
         g_free(name);
         return NULL;
     }
-    ctype = g_content_type_guess(name, (const guchar *)data, len, NULL);
+    ctype = g_content_type_guess(name, (const guchar *)data,
+                                 MIN(len, (gsize)4096), NULL);
     mime = g_content_type_get_mime_type(ctype);
 
     if (mime && g_str_has_prefix(mime, "image/") &&
         strcmp(mime, "image/svg+xml") != 0) {
         if (len > ATT_IMG_MAX) {
             *why = g_strdup_printf("%s: image larger than %u MiB",
-                                   name, ATT_IMG_MAX >> 20);
+                                   name, (unsigned)(ATT_IMG_MAX >> 20));
         } else if (mime_passthrough(mime)) {
             a = g_new0(Attachment, 1);
             a->data = g_base64_encode((const guchar *)data, len);
@@ -2148,11 +2277,16 @@ static Attachment *attachment_load(GFile *f, char **why)
         if (a)
             a->image = TRUE;
     } else if (len > ATT_TXT_MAX) {
-        *why = g_strdup_printf("%s: text file larger than %u KiB",
-                               name, ATT_TXT_MAX >> 10);
-    } else if (memchr(data, '\0', len) ||
-               !g_utf8_validate(data, (gssize)len, NULL)) {
-        *why = g_strdup_printf("%s: neither an image nor UTF-8 text", name);
+        *why = g_strdup_printf("%s: text file larger than %u MiB",
+                               name, (unsigned)(ATT_TXT_MAX >> 20));
+    } else if (memchr(data, '\0', len)) {
+        *why = g_strdup_printf("%s: binary file (neither an image nor text)",
+                               name);
+    } else if (!g_utf8_validate(data, (gssize)len, NULL)) {
+        /* Large logs / legacy encodings: sanitize invalid byte sequences
+         * to U+FFFD instead of rejecting the file. */
+        a = g_new0(Attachment, 1);
+        a->data = g_utf8_make_valid(data, (gssize)len);
     } else {
         a = g_new0(Attachment, 1);
         a->data = data;                          /* takes ownership */
@@ -3134,7 +3268,8 @@ static gpointer worker_thread(gpointer data)
     if (hl)
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, wd->req->body);
-    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(wd->req->body));
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE,
+                     (curl_off_t)strlen(wd->req->body));
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, worker_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, wd);
     curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, worker_progress);
@@ -3782,12 +3917,14 @@ static void build_settings_pane(App *app, GtkWidget *left)
 static void build_chat_pane(App *app, GtkWidget *right)
 {
     GtkWidget *sw, *cbox, *row, *arow, *scroll_in;
-    GtkEventController *key;
+    GtkEventController *key, *motion;
+    GtkGesture *click;
 
     app->chat_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_add_css_class(app->chat_box, "chat");
 
     sw = gtk_scrolled_window_new();
+    app->chat_sw = sw;
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
                                     GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), app->chat_box);
@@ -3801,6 +3938,21 @@ static void build_chat_pane(App *app, GtkWidget *right)
                      G_CALLBACK(on_adj_bounds), app);
     g_signal_connect(app->chat_adj, "notify::page-size",
                      G_CALLBACK(on_adj_bounds), app);
+
+    /* Capture mouse motion and button release on the scrolled window so
+     * dragging a text selection to the top/bottom edge scrolls the chat. */
+    motion = gtk_event_controller_motion_new();
+    gtk_event_controller_set_propagation_phase(motion, GTK_PHASE_CAPTURE);
+    g_signal_connect(motion, "motion", G_CALLBACK(on_chat_motion), app);
+    gtk_widget_add_controller(sw, motion);
+
+    click = gtk_gesture_click_new();
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(click),
+                                               GTK_PHASE_CAPTURE);
+    g_signal_connect(click, "released", G_CALLBACK(on_chat_btn_released), app);
+    g_signal_connect_swapped(click, "stopped",
+                             G_CALLBACK(drag_scroll_stop), app);
+    gtk_widget_add_controller(sw, GTK_EVENT_CONTROLLER(click));
 
     cbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     app->input_buf = gtk_text_buffer_new(NULL);
@@ -3883,6 +4035,7 @@ static gboolean on_close_request(GtkWindow *w, gpointer data)
     App *app = data;
 
     (void)w;
+    drag_scroll_stop(app);
     if (app->save_id) {
         g_source_remove(app->save_id);
         app->save_id = 0;
