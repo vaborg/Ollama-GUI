@@ -25,16 +25,28 @@
  * Markdown, or the canonical JSON history when the name ends in .json.
  * "Save code" writes the fenced code blocks of the latest reply that
  * has any: one block via a save dialog, several into a chosen folder.
- * Transcript: your turns are bubbles on the right, replies on the left;
- * a reply's thinking sits behind a collapsed "+ Thinking" toggle.
+ * Transcript: both your turns and the replies are full-width bubbles
+ * (yours tinted blue, with a "You" caption); a reply's thinking sits
+ * behind a collapsed "+ Thinking" toggle.
  * Parameters: each sampling parameter has an on/off switch; thinking and
  * effort can be left at the model default (omitted from the request).
+ * Output length: "Max tokens" is off by default, so OpenAI, Gemini and
+ * Ollama get their model maximum. Anthropic, where the field is
+ * mandatory, gets 32000 (64000 with thinking on), clamped to 21333 for
+ * non-streaming requests as the API demands. When an API answers that
+ * the value is above the model's limit, that limit is learned (shown
+ * under Parameters, saved in the config, resettable) and the turn is
+ * resent with it. Auto-continue: a reply that still ends because of the
+ * token limit is extended automatically — the partial reply is kept, a
+ * "continue" nudge is sent, and the continuation is appended to the
+ * same bubble and merged into the same history turn (up to 8 times).
  * Auto-adapt: when an API answers HTTP 400/422 naming a parameter, that
  * parameter is remembered as unsupported for that provider/model (saved
  * in the config, shown under Parameters, resettable) and the turn is
  * resent without it.
- * Config: ~/.config/cloud-chat/config.ini (chmod 600). API keys are
- * stored there in plain text ONLY if "Remember keys" is checked.
+ * Config: ~/.config/ollama-gui/config.ini (chmod 600). API keys are
+ * stored there in plain text ONLY if "Remember keys" is checked. The
+ * last model name is remembered per provider.
  */
 
 #include <gtk/gtk.h>
@@ -42,6 +54,7 @@
 #include <curl/curl.h>
 #include <glib/gstdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if GLIB_CHECK_VERSION(2, 74, 0)
@@ -56,6 +69,20 @@
 /* edge zone (px) and max speed (px/tick) for drag-select auto-scroll */
 #define AUTO_SCROLL_EDGE  48.0
 #define AUTO_SCROLL_SPEED 28.0
+
+/* auto-continue after the output-token limit, and auto-adapt resends */
+#define MAX_CONTINUES      8u
+#define MAX_ADAPT_RETRIES  6u
+
+/* Anthropic: max_tokens is mandatory; these are used when "Max tokens"
+ * is switched off. Non-streaming requests above 21333 are refused. */
+#define ANTHROPIC_MAX_DEFAULT        32000
+#define ANTHROPIC_MAX_DEFAULT_THINK  64000
+#define ANTHROPIC_MAX_NONSTREAM      21333
+
+static const char CONTINUE_PROMPT[] =
+    "Continue exactly where you left off, without repeating anything you "
+    "already wrote and without any preamble.";
 
 /* ================================================================== */
 /*  provider table                                                    */
@@ -177,15 +204,23 @@ static JsonArray *j_arr(JsonObject *o, const char *k)
     return JSON_NODE_HOLDS_ARRAY(n) ? json_node_get_array(n) : NULL;
 }
 
-static char *j_ser(JsonNode *n)
+static char *node_to_string(JsonNode *n, gboolean pretty)
 {
     JsonGenerator *g = json_generator_new();
     char *s;
 
     json_generator_set_root(g, n);
+    json_generator_set_pretty(g, pretty);
+    if (pretty)
+        json_generator_set_indent(g, 2);
     s = json_generator_to_data(g, NULL);
     g_object_unref(g);
     return s;
+}
+
+static char *j_ser(JsonNode *n)
+{
+    return node_to_string(n, FALSE);
 }
 
 /* {"error":"..."} or {"error":{"message":"..."}} -> message */
@@ -202,20 +237,6 @@ static char *err_text(JsonObject *o)
     else if (JSON_NODE_HOLDS_OBJECT(n))
         s = j_str(json_node_get_object(n), "message");
     return g_strdup(s ? s : "unknown API error");
-}
-
-static char *node_to_string(JsonNode *n, gboolean pretty)
-{
-    JsonGenerator *g = json_generator_new();
-    char *s;
-
-    json_generator_set_root(g, n);
-    json_generator_set_pretty(g, pretty);
-    if (pretty)
-        json_generator_set_indent(g, 2);
-    s = json_generator_to_data(g, NULL);
-    g_object_unref(g);
-    return s;
 }
 
 /* base64 magic bytes -> MIME (attachments carry no extension here) */
@@ -481,6 +502,7 @@ typedef struct {
     char  *body;      /* JSON to POST                        */
     char **headers;   /* NULL-terminated "Name: value" list */
     guint  sent;      /* P_* / S_* bits actually put in the body */
+    int    max_sent;  /* output-token limit in the body, 0 = none */
 } ProvRequest;
 
 static void header_add(char ***hdrs, const char *fmt, ...)
@@ -542,6 +564,7 @@ typedef struct {
     gboolean    use_temp, use_topp, use_maxtok, use_seed;
     double      temp, top_p;
     int         max_tokens;
+    int         max_cap;    /* model's output limit, 0 = unknown */
     gint64      seed;
     int         think;      /* THINK_*                         */
     const char *effort;     /* NULL = model default (omitted)  */
@@ -567,6 +590,31 @@ static guint builtin_quirks(ProvId id, const char *model)
         return P_TEMP | P_TOPP | P_NO_OFF;    /* sampling removed, thinking always on */
     if (id == PROV_OPENAI && openai_reasoner(model))
         return P_TEMP | P_TOPP | P_SEED | P_MCT;
+    return 0;
+}
+
+/* known output-token ceilings (0 = unknown, let the API tell us) */
+static guint builtin_cap(ProvId id, const char *model)
+{
+    if (!model)
+        return 0;
+    if (id == PROV_ANTHROPIC) {
+        if (g_str_has_prefix(model, "claude-3-5-"))
+            return 8192;
+        if (g_str_has_prefix(model, "claude-3-7"))
+            return 64000;
+        if (g_str_has_prefix(model, "claude-3-"))
+            return 4096;
+        if (g_str_has_prefix(model, "claude-opus-4-") &&
+            model[14] && strchr("012", model[14]))      /* 4, 4.1 */
+            return 32000;
+    } else if (id == PROV_OPENAI) {
+        if (g_str_has_prefix(model, "gpt-4o"))
+            return 16384;
+        if (g_str_has_prefix(model, "gpt-4-") || !strcmp(model, "gpt-4") ||
+            g_str_has_prefix(model, "gpt-3.5"))
+            return 4096;
+    }
     return 0;
 }
 
@@ -604,13 +652,58 @@ static guint classify_rejection(ProvId id, const char *msg, guint sent,
             add |= P_NO_OFF;
         else if ((sent & S_ADAPTIVE) && strstr(m, "display"))
             add |= P_NODISPLAY;
-        else if ((sent & S_ADAPTIVE) && strstr(m, "adaptive"))
+        else if ((sent & S_ADAPTIVE) &&
+                 (strstr(m, "adaptive") || strstr(m, "'enabled'")))
             add |= P_LEGACY;
         else if (strstr(m, "think") || strstr(m, "budget"))
             add |= P_THINK;
     }
     g_free(m);
     return add & ~quirks & Q_MASK;
+}
+
+/* "max_tokens: 64000 > 8192, which is the maximum allowed…" or
+ * "This model supports at most 16384 completion tokens" -> 8192/16384.
+ * The limit is the largest stand-alone number below what we sent;
+ * digits glued to '-', '.', '_' or letters (model names, dates) are
+ * ignored. 0 when the message is not a "too large" complaint. */
+static int rejection_cap(const char *msg, int sent_max)
+{
+    char *m = g_ascii_strdown(msg ? msg : "", -1);
+    const char *p;
+    long best = 0;
+
+    if (sent_max <= 0 ||
+        !(strstr(m, "max_tokens") || strstr(m, "max_completion_tokens") ||
+          strstr(m, "max_output_tokens") || strstr(m, "maxoutputtokens") ||
+          strstr(m, "output tokens") || strstr(m, "completion tokens")) ||
+        !(strchr(m, '>') || strstr(m, "too large") || strstr(m, "maximum") ||
+          strstr(m, "at most") || strstr(m, "exceed") ||
+          strstr(m, "less than") || strstr(m, "<="))) {
+        g_free(m);
+        return 0;
+    }
+    for (p = m; *p; ) {
+        const char *q;
+
+        if (!g_ascii_isdigit(*p)) {
+            p++;
+            continue;
+        }
+        q = p;
+        while (g_ascii_isdigit(*q))
+            q++;
+        if (!(p > m && (g_ascii_isalnum(p[-1]) || strchr("-._", p[-1]))) &&
+            !(*q && (g_ascii_isalnum(*q) || strchr("-._", *q)))) {
+            long v = strtol(p, NULL, 10);
+
+            if (v >= 256 && v < sent_max && v > best)
+                best = v;
+        }
+        p = q;
+    }
+    g_free(m);
+    return (int)best;
 }
 
 static ProvRequest *prov_build_request(ProvId id, const char *host,
@@ -625,11 +718,12 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
     char **h = NULL;
     char *base = strip_host(host, prov_get(id)->default_host);
     const guint q = gp->quirks;
+    const int cap = gp->max_cap;
+    const int maxreq = (cap > 0 && gp->max_tokens > cap) ? cap : gp->max_tokens;
     const gboolean temp_on = gp->use_temp && !(q & P_TEMP) && gp->temp >= 0.0;
     const gboolean topp_on = gp->use_topp && !(q & P_TOPP) &&
                              gp->top_p > 0.0 && gp->top_p <= 1.0;
-    const gboolean max_on  = gp->use_maxtok && !(q & P_MAXTOK) &&
-                             gp->max_tokens > 0;
+    const gboolean max_on  = gp->use_maxtok && !(q & P_MAXTOK) && maxreq > 0;
     const gboolean seed_on = gp->use_seed && !(q & P_SEED) && gp->seed >= 0;
     const char *effort = (q & P_EFFORT) ? NULL : gp->effort;
     const int think = (q & P_THINK) ? THINK_DEFAULT
@@ -652,9 +746,9 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
         json_object_set_boolean_member(root, "stream", stream);
         if (max_on) {
             json_object_set_int_member(root,
-                (q & P_MCT) ? "max_completion_tokens" : "max_tokens",
-                gp->max_tokens);
+                (q & P_MCT) ? "max_completion_tokens" : "max_tokens", maxreq);
             sent |= P_MAXTOK;
+            r->max_sent = maxreq;
         }
         if (temp_on) {
             json_object_set_double_member(root, "temperature", gp->temp);
@@ -682,10 +776,15 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
         break;
 
     case PROV_ANTHROPIC: {
-        /* max_tokens is required; thinking counts against it */
-        int maxtok = max_on ? gp->max_tokens
-                            : (think == THINK_ON ? 16000 : 8192);
+        /* max_tokens is mandatory; thinking counts against it */
+        int maxtok = max_on ? maxreq
+                   : (think == THINK_ON ? ANTHROPIC_MAX_DEFAULT_THINK
+                                        : ANTHROPIC_MAX_DEFAULT);
 
+        if (cap > 0 && maxtok > cap)
+            maxtok = cap;
+        if (!stream && maxtok > ANTHROPIC_MAX_NONSTREAM)
+            maxtok = ANTHROPIC_MAX_NONSTREAM;   /* API rule: long jobs must stream */
         if (key && *key)
             header_add(&h, "x-api-key: %s", key);
         header_add(&h, "anthropic-version: 2023-06-01");
@@ -723,6 +822,7 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
             sent |= P_THINK | S_DISABLED;
         }
         json_object_set_int_member(root, "max_tokens", maxtok);
+        r->max_sent = maxtok;
         json_object_set_boolean_member(root, "stream", stream);
         /* no sampling with thinking on; and one of temperature / top_p,
          * since Claude 4.5 and later reject the two together */
@@ -778,8 +878,9 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
             sent |= P_TOPP;
         }
         if (max_on) {
-            json_object_set_int_member(gc, "maxOutputTokens", gp->max_tokens);
+            json_object_set_int_member(gc, "maxOutputTokens", maxreq);
             sent |= P_MAXTOK;
+            r->max_sent = maxreq;
         }
         if (seed_on) {
             json_object_set_int_member(gc, "seed", gp->seed);
@@ -822,8 +923,9 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
             sent |= P_TOPP;
         }
         if (max_on) {
-            json_object_set_int_member(opt, "num_predict", gp->max_tokens);
+            json_object_set_int_member(opt, "num_predict", maxreq);
             sent |= P_MAXTOK;
+            r->max_sent = maxreq;
         }
         if (seed_on) {
             json_object_set_int_member(opt, "seed", gp->seed);
@@ -852,6 +954,7 @@ static ProvRequest *prov_build_request(ProvId id, const char *host,
 typedef struct {
     ProvId      id;
     gint64      in_tok, out_tok;
+    gboolean    truncated;      /* stopped by the output-token limit */
     char       *error;
     JsonParser *jp;             /* reused for every streamed line */
 } ProvParser;
@@ -880,6 +983,11 @@ static const char *prov_parser_error(const ProvParser *p)
     return p ? p->error : NULL;
 }
 
+static gboolean prov_parser_truncated(const ProvParser *p)
+{
+    return p ? p->truncated : FALSE;
+}
+
 static void prov_parser_usage(const ProvParser *p, gint64 *in_tok, gint64 *out_tok)
 {
     if (in_tok)
@@ -889,15 +997,19 @@ static void prov_parser_usage(const ProvParser *p, gint64 *in_tok, gint64 *out_t
 }
 
 /* Gemini: text vs. thought is decided per part by the "thought" flag */
-static void gemini_collect(JsonObject *o, GString *text, GString *think)
+static void gemini_collect(JsonObject *o, GString *text, GString *think,
+                           gboolean *trunc)
 {
     JsonArray *cand = j_arr(o, "candidates");
 
     if (cand && json_array_get_length(cand) > 0) {
-        JsonArray *parts = j_arr(j_obj(json_array_get_object_element(cand, 0),
-                                       "content"), "parts");
+        JsonObject *c0 = json_array_get_object_element(cand, 0);
+        JsonArray *parts = j_arr(j_obj(c0, "content"), "parts");
+        const char *fr = j_str(c0, "finishReason");
         guint k;
 
+        if (fr && trunc && !strcmp(fr, "MAX_TOKENS"))
+            *trunc = TRUE;
         if (parts)
             for (k = 0; k < json_array_get_length(parts); k++) {
                 JsonObject *pt = json_array_get_object_element(parts, k);
@@ -965,9 +1077,11 @@ static gboolean prov_parser_feed(ProvParser *p, const char *line,
         JsonObject *u = j_obj(o, "usage");
 
         if (ch && json_array_get_length(ch) > 0) {
-            JsonObject *d = j_obj(json_array_get_object_element(ch, 0), "delta");
+            JsonObject *c0 = json_array_get_object_element(ch, 0);
+            JsonObject *d = j_obj(c0, "delta");
             const char *t = j_str(d, "content");
             const char *r = j_str(d, "reasoning_content");
+            const char *fr = j_str(c0, "finish_reason");
 
             if (!r)
                 r = j_str(d, "reasoning");   /* OpenRouter/DeepSeek */
@@ -975,6 +1089,8 @@ static gboolean prov_parser_feed(ProvParser *p, const char *line,
                 g_string_append(text, t);
             if (r && *r && think)
                 g_string_append(think, r);
+            if (fr && !strcmp(fr, "length"))
+                p->truncated = TRUE;
         }
         if (u) {
             p->in_tok  = j_int(u, "prompt_tokens", p->in_tok);
@@ -1003,14 +1119,18 @@ static gboolean prov_parser_feed(ProvParser *p, const char *line,
             }
         } else if (type && !strcmp(type, "message_delta")) {
             JsonObject *u = j_obj(o, "usage");
+            const char *sr = j_str(j_obj(o, "delta"), "stop_reason");
+
             p->out_tok = j_int(u, "output_tokens", p->out_tok);
+            if (sr && !strcmp(sr, "max_tokens"))
+                p->truncated = TRUE;
         }
         break;
     }
     case PROV_GOOGLE: {
         JsonObject *um = j_obj(o, "usageMetadata");
 
-        gemini_collect(o, text, think);
+        gemini_collect(o, text, think, &p->truncated);
         if (!j_arr(o, "candidates")) {
             const char *br = j_str(j_obj(o, "promptFeedback"), "blockReason");
             if (br) {
@@ -1040,8 +1160,12 @@ static gboolean prov_parser_feed(ProvParser *p, const char *line,
                 g_string_append(think, th);
         }
         if (j_bool(o, "done")) {
+            const char *dr = j_str(o, "done_reason");
+
             p->in_tok  = j_int(o, "prompt_eval_count", p->in_tok);
             p->out_tok = j_int(o, "eval_count", p->out_tok);
+            if (dr && !strcmp(dr, "length"))
+                p->truncated = TRUE;
         }
         break;
     }
@@ -1051,8 +1175,9 @@ static gboolean prov_parser_feed(ProvParser *p, const char *line,
 
 /* whole-body parse for stream = FALSE */
 static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
-                                 GString *text, GString *think,
-                                 gint64 *in_tok, gint64 *out_tok, char **error)
+                                GString *text, GString *think,
+                                gint64 *in_tok, gint64 *out_tok,
+                                gboolean *truncated, char **error)
 {
     JsonParser *jp;
     JsonNode *rn;
@@ -1063,6 +1188,8 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
         *in_tok = -1;
     if (out_tok)
         *out_tok = -1;
+    if (truncated)
+        *truncated = FALSE;
 
     jp = json_parser_new();
     if (!json_parser_load_from_data(jp, body ? body : "", (gssize)len, NULL)) {
@@ -1093,19 +1220,24 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
     switch (id) {
     case PROV_OPENAI: {
         JsonArray *ch = j_arr(o, "choices");
-        JsonObject *m = NULL, *u = j_obj(o, "usage");
-        const char *t, *r;
+        JsonObject *c0 = NULL, *m = NULL, *u = j_obj(o, "usage");
+        const char *t, *r, *fr;
 
-        if (ch && json_array_get_length(ch) > 0)
-            m = j_obj(json_array_get_object_element(ch, 0), "message");
+        if (ch && json_array_get_length(ch) > 0) {
+            c0 = json_array_get_object_element(ch, 0);
+            m = j_obj(c0, "message");
+        }
         t = j_str(m, "content");
         r = j_str(m, "reasoning_content");
         if (!r)
             r = j_str(m, "reasoning");
+        fr = j_str(c0, "finish_reason");
         if (t && text)
             g_string_append(text, t);
         if (r && think)
             g_string_append(think, r);
+        if (fr && truncated && !strcmp(fr, "length"))
+            *truncated = TRUE;
         if (u) {
             if (in_tok)
                 *in_tok = j_int(u, "prompt_tokens", -1);
@@ -1117,6 +1249,7 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
     case PROV_ANTHROPIC: {
         JsonArray *c = j_arr(o, "content");
         JsonObject *u = j_obj(o, "usage");
+        const char *sr = j_str(o, "stop_reason");
         guint k;
 
         if (c)
@@ -1134,6 +1267,8 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
                         g_string_append(think, t);
                 }
             }
+        if (sr && truncated && !strcmp(sr, "max_tokens"))
+            *truncated = TRUE;
         if (u) {
             if (in_tok)
                 *in_tok = j_int(u, "input_tokens", -1);
@@ -1147,7 +1282,7 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
         JsonObject *pf = j_obj(o, "promptFeedback");
         const char *br = pf ? j_str(pf, "blockReason") : NULL;
 
-        gemini_collect(o, text, think);
+        gemini_collect(o, text, think, truncated);
         if (br) {
             g_object_unref(jp);
             if (error)
@@ -1164,6 +1299,7 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
     }
     default: {                              /* Ollama */
         const char *resp = j_str(o, "response");
+        const char *dr = j_str(o, "done_reason");
         JsonObject *m = j_obj(o, "message");
 
         if (resp && text)
@@ -1176,6 +1312,8 @@ static gboolean prov_parse_body(ProvId id, const char *body, gsize len,
             if (th && think)
                 g_string_append(think, th);
         }
+        if (dr && truncated && !strcmp(dr, "length"))
+            *truncated = TRUE;
         if (in_tok)
             *in_tok = j_int(o, "prompt_eval_count", -1);
         if (out_tok)
@@ -1340,6 +1478,7 @@ static char **prov_parse_models(ProvId id, const char *body, gsize len)
 /* ================================================================== */
 
 typedef struct App App;
+typedef struct ModelsJob ModelsJob;
 
 typedef struct {
     char    *name;       /* basename: display and <file name="..."> */
@@ -1348,15 +1487,16 @@ typedef struct {
     gsize    bytes;      /* size on disk                             */
 } Attachment;
 
-
 typedef struct {
     App         *app;
     ProvRequest *req;
     ProvId       prov;
     gboolean     stream;
+    GThread     *thread;       /* joined by worker_done_idle / shutdown */
     gint         refs;         /* g_atomic: done path + one queued flush */
     gint         cancel;       /* g_atomic access */
     gboolean     cancelled;    /* worker thread only, until done */
+    gboolean     truncated;    /* ended because of the output-token limit */
     ProvParser  *parser;
     GString     *pending;      /* stream line buffer */
     GString     *full;         /* body; streams keep the first ERR_BODY_CAP */
@@ -1374,6 +1514,17 @@ typedef struct {
     gboolean     q_scheduled;
 } Worker;
 
+struct ModelsJob {
+    App     *app;
+    ProvId   id;
+    char    *url;
+    char   **headers;
+    char    *err;
+    char   **names;
+    GThread *thread;
+    gint     cancel;           /* g_atomic access */
+};
+
 struct App {
     GtkWindow     *win;
 
@@ -1382,6 +1533,7 @@ struct App {
     ProvId         prov_id;
     char          *keys[PROV_COUNT];
     char          *hosts[PROV_COUNT];
+    char          *pmodel[PROV_COUNT];  /* last model name per provider */
 
     /* model + parameters */
     GtkWidget     *model_entry, *model_dd;
@@ -1389,9 +1541,10 @@ struct App {
     GPtrArray     *models;           /* char* */
     GtkWidget     *temp_e, *topp_e, *maxtok_e, *seed_e;
     GtkWidget     *temp_cb, *topp_cb, *maxtok_cb, *seed_cb;   /* send it? */
-    GtkWidget     *think_dd, *effort_dd, *adapt_cb;
+    GtkWidget     *think_dd, *effort_dd, *adapt_cb, *cont_cb;
     GtkWidget     *quirk_label, *quirk_reset;
     GHashTable    *quirks;            /* "provider/model" -> learned P_* */
+    GHashTable    *caps;              /* "provider/model" -> output limit */
     GtkWidget     *stream_cb, *newchat_btn;
     GtkTextBuffer *sys_buf;
 
@@ -1411,8 +1564,12 @@ struct App {
     GString       *reply_acc;
     gboolean       busy;
     GtkWidget     *cur_box;           /* reply bubble being streamed */
+    GtkWidget     *cur_anchor;        /* the thinking toggle goes after this */
     GtkTextBuffer *cur_think_buf, *cur_text_buf;   /* NULL until needed */
+    guint          cont_count;        /* auto-continues for this turn */
+    gboolean       continuing;        /* current request is a continuation */
     Worker        *worker;
+    ModelsJob     *models_job;        /* model list being loaded, or NULL */
     gint64         total_in, total_out, requests;
     gboolean       quiet;             /* programmatic entry updates */
     gboolean       closing;           /* window gone: idles skip the UI */
@@ -1427,7 +1584,7 @@ struct App {
     char          *cfg_model;
     double         cfg_temp, cfg_topp;
     gint64         cfg_maxtok, cfg_seed;
-    gboolean       cfg_stream, cfg_remember, cfg_adapt;
+    gboolean       cfg_stream, cfg_remember, cfg_adapt, cfg_cont;
     gboolean       cfg_use_temp, cfg_use_topp, cfg_use_maxtok, cfg_use_seed;
     int            cfg_think, cfg_effort;
 };
@@ -1452,12 +1609,18 @@ static char *buffer_text(GtkTextBuffer *b)
     return gtk_text_buffer_get_text(b, &s, &e, FALSE);
 }
 
+static const char *current_model(App *app)
+{
+    return gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+}
+
 /* ------------------------------------------------------------------ */
 /*  transcript: bubbles in a vertical box                             */
 /* ------------------------------------------------------------------ */
 
 static const char CHAT_CSS[] =
     ".chat { padding: 10px; }\n"
+    ".chat-window { border-radius: 6px; }\n"
     ".bubble-user { background-color: alpha(#3584e4, 0.18);"
     "  border-radius: 14px 14px 4px 14px; padding: 8px 12px; }\n"
     ".bubble-asst { background-color: alpha(#808080, 0.12);"
@@ -1469,7 +1632,11 @@ static const char CHAT_CSS[] =
     ".think-view { font-style: italic; opacity: 0.7; }\n"
     ".caption { font-size: smaller; font-weight: bold; }\n"
     ".note { font-size: smaller; }\n"
-    ".note-error { color: #c01c28; }\n";
+    ".note-error { color: #c01c28; }\n"
+    ".cont-marker { font-size: smaller; font-style: italic; opacity: 0.7; }\n"
+    ".composer > label { font-size: smaller; font-weight: bold; opacity: 0.75; }\n"
+    ".composer-input { border-radius: 6px; }\n"
+    ".composer-input textview { padding: 4px; }\n";
 
 static void load_css(void)
 {
@@ -1641,6 +1808,7 @@ static void chat_clear(App *app)
     while ((c = gtk_widget_get_first_child(app->chat_box)) != NULL)
         gtk_box_remove(GTK_BOX(app->chat_box), c);
     app->cur_box = NULL;
+    app->cur_anchor = NULL;
     app->cur_think_buf = app->cur_text_buf = NULL;
 }
 
@@ -1670,6 +1838,18 @@ static GtkWidget *bubble_text_view(GtkTextBuffer **buf, const char *css)
     return tv;
 }
 
+/* small bold caption at the top of a bubble ("You", model name) */
+static GtkWidget *bubble_caption(const char *text)
+{
+    GtkWidget *cap = gtk_label_new(text);
+
+    gtk_widget_add_css_class(cap, "caption");
+    gtk_widget_add_css_class(cap, "dim-label");
+    gtk_widget_set_halign(cap, GTK_ALIGN_START);
+    gtk_label_set_selectable(GTK_LABEL(cap), TRUE);
+    return cap;
+}
+
 /* status / error lines inside the transcript */
 static void chat_note(App *app, const char *text, gboolean error)
 {
@@ -1681,15 +1861,17 @@ static void chat_note(App *app, const char *text, gboolean error)
     chat_add(app, l);
 }
 
-/* your turn: right-aligned bubble using GtkTextView for smooth mouse selection */
+/* your turn: a full-width tinted bubble using GtkTextView for smooth
+ * mouse selection */
 static void chat_add_user(App *app, const char *text, GPtrArray *att)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     guint i;
 
     gtk_widget_add_css_class(box, "bubble-user");
-    gtk_widget_set_halign(box, GTK_ALIGN_END);
-    gtk_widget_set_margin_start(box, 64);
+    gtk_widget_set_halign(box, GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(box, TRUE);
+    gtk_box_append(GTK_BOX(box), bubble_caption("You"));
     if (text && *text) {
         GtkTextBuffer *b = NULL;
         GtkWidget *tv = bubble_text_view(&b, NULL);
@@ -1705,7 +1887,6 @@ static void chat_add_user(App *app, const char *text, GPtrArray *att)
             g_string_append_printf(s, "%s%s", i ? " · " : "📎 ",
                 ((Attachment *)g_ptr_array_index(att, i))->name);
         l = wrap_label(s->str);
-        gtk_label_set_max_width_chars(GTK_LABEL(l), 72);
         gtk_widget_add_css_class(l, "dim-label");
         gtk_box_append(GTK_BOX(box), l);
         g_string_free(s, TRUE);
@@ -1713,23 +1894,19 @@ static void chat_add_user(App *app, const char *text, GPtrArray *att)
     chat_add(app, box);
 }
 
-/* reply: left-aligned bubble, full width minus a right gutter */
+/* reply: full-width bubble */
 static void asst_begin(App *app)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
-    GtkWidget *cap = gtk_label_new(model && *model ? model : "assistant");
+    const char *model = current_model(app);
+    GtkWidget *cap = bubble_caption(model && *model ? model : "assistant");
 
     gtk_widget_add_css_class(box, "bubble-asst");
     gtk_widget_set_halign(box, GTK_ALIGN_FILL);
     gtk_widget_set_hexpand(box, TRUE);
-    gtk_widget_set_margin_end(box, 64);
-    gtk_widget_add_css_class(cap, "caption");
-    gtk_widget_add_css_class(cap, "dim-label");
-    gtk_widget_set_halign(cap, GTK_ALIGN_START);
-    gtk_label_set_selectable(GTK_LABEL(cap), TRUE);
     gtk_box_append(GTK_BOX(box), cap);
     app->cur_box = box;
+    app->cur_anchor = cap;
     chat_add(app, box);
 }
 
@@ -1742,13 +1919,15 @@ static void on_think_toggle(GtkButton *b, gpointer data)
     gtk_button_set_label(b, show ? "✕  Thinking" : "＋  Thinking");
 }
 
-/* collapsed thinking section, placed right under the caption */
+/* collapsed thinking section, placed right under the caption (or under
+ * the continuation marker for a continued reply) */
 static void asst_think(App *app)
 {
     GtkWidget *btn = gtk_button_new_with_label("＋  Thinking");
     GtkWidget *rev = gtk_revealer_new();
     GtkWidget *tv = bubble_text_view(&app->cur_think_buf, "think-view");
-    GtkWidget *cap = gtk_widget_get_first_child(app->cur_box);
+    GtkWidget *anchor = app->cur_anchor ? app->cur_anchor
+                                        : gtk_widget_get_first_child(app->cur_box);
 
     gtk_widget_add_css_class(btn, "flat");
     gtk_widget_add_css_class(btn, "think-toggle");
@@ -1758,7 +1937,7 @@ static void asst_think(App *app)
     gtk_revealer_set_reveal_child(GTK_REVEALER(rev), FALSE);
     gtk_revealer_set_child(GTK_REVEALER(rev), tv);
     g_signal_connect(btn, "clicked", G_CALLBACK(on_think_toggle), rev);
-    gtk_box_insert_child_after(GTK_BOX(app->cur_box), btn, cap);
+    gtk_box_insert_child_after(GTK_BOX(app->cur_box), btn, anchor);
     gtk_box_insert_child_after(GTK_BOX(app->cur_box), rev, btn);
 }
 
@@ -1766,6 +1945,21 @@ static void asst_text(App *app)
 {
     gtk_box_append(GTK_BOX(app->cur_box),
                    bubble_text_view(&app->cur_text_buf, NULL));
+}
+
+/* the reply hit the token limit and is being continued: mark the seam
+ * and start a fresh text (and thinking) section below it */
+static void asst_continue_marker(App *app)
+{
+    GtkWidget *l = gtk_label_new("⟳ continued — the previous part hit the "
+                                 "output-token limit");
+
+    gtk_widget_add_css_class(l, "cont-marker");
+    gtk_widget_add_css_class(l, "dim-label");
+    gtk_widget_set_halign(l, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(app->cur_box), l);
+    app->cur_anchor = l;
+    app->cur_think_buf = app->cur_text_buf = NULL;
 }
 
 /* append, dropping the newlines models like to open with */
@@ -1853,7 +2047,6 @@ static void show_text_window(App *app, const char *title, const char *text)
     gtk_window_set_default_size(GTK_WINDOW(win), 780, 560);
     gtk_window_set_transient_for(GTK_WINDOW(win), app->win);
     gtk_window_present(GTK_WINDOW(win));
-    (void)app;
 }
 
 /* ================================================================== */
@@ -1878,6 +2071,34 @@ static gboolean key_bool(GKeyFile *kf, const char *g, const char *k, gboolean d)
            ? g_key_file_get_boolean(kf, g, k, NULL) : d;
 }
 
+/* "provider/model" -> n as an integer key under `group` */
+static void save_int_table(GKeyFile *kf, const char *group, GHashTable *t)
+{
+    GHashTableIter it;
+    gpointer k, v;
+
+    g_hash_table_iter_init(&it, t);
+    while (g_hash_table_iter_next(&it, &k, &v))
+        if (!strpbrk(k, "=[]\n"))         /* not a valid key name */
+            g_key_file_set_integer(kf, group, k, (int)GPOINTER_TO_UINT(v));
+}
+
+static void load_int_table(GKeyFile *kf, const char *group, GHashTable *t,
+                           guint mask)
+{
+    gsize n = 0, k;
+    char **keys = g_key_file_get_keys(kf, group, &n, NULL);
+
+    for (k = 0; keys && k < n; k++) {
+        int raw = g_key_file_get_integer(kf, group, keys[k], NULL);
+        guint v = raw > 0 ? ((guint)raw & mask) : 0;
+
+        if (v)
+            g_hash_table_replace(t, g_strdup(keys[k]), GUINT_TO_POINTER(v));
+    }
+    g_strfreev(keys);
+}
+
 static void config_save(App *app)
 {
     GKeyFile *kf = g_key_file_new();
@@ -1887,9 +2108,11 @@ static void config_save(App *app)
     int i;
 
     remember = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->remember_cb));
+    g_free(app->pmodel[app->prov_id]);
+    app->pmodel[app->prov_id] = g_strdup(current_model(app));
+
     g_key_file_set_integer(kf, "ui", "provider", (int)app->prov_id);
-    g_key_file_set_string(kf, "ui", "model",
-                          gtk_editable_get_text(GTK_EDITABLE(app->model_entry)));
+    g_key_file_set_string(kf, "ui", "model", current_model(app));
     g_key_file_set_double(kf, "gen", "temperature", entry_double(app->temp_e));
     g_key_file_set_double(kf, "gen", "top_p", entry_double(app->topp_e));
     g_key_file_set_int64(kf, "gen", "max_tokens", entry_ll(app->maxtok_e, 0));
@@ -1910,24 +2133,20 @@ static void config_save(App *app)
         (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(app->effort_dd)));
     g_key_file_set_boolean(kf, "gen", "auto_adapt",
         gtk_check_button_get_active(GTK_CHECK_BUTTON(app->adapt_cb)));
-    {
-        GHashTableIter it;
-        gpointer k, v;
-
-        g_hash_table_iter_init(&it, app->quirks);
-        while (g_hash_table_iter_next(&it, &k, &v))
-            if (!strpbrk(k, "=[]\n"))         /* not a valid key name */
-                g_key_file_set_integer(kf, "quirks", k,
-                                       (int)GPOINTER_TO_UINT(v));
-    }
+    g_key_file_set_boolean(kf, "gen", "auto_continue",
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(app->cont_cb)));
+    save_int_table(kf, "quirks", app->quirks);
+    save_int_table(kf, "caps", app->caps);
     g_key_file_set_boolean(kf, "auth", "remember", remember);
     for (i = 0; i < PROV_COUNT; i++) {
+        const char *nm = prov_get((ProvId)i)->id_name;
+
         if (app->hosts[i] && *app->hosts[i])
-            g_key_file_set_string(kf, "hosts", prov_get((ProvId)i)->id_name,
-                                  app->hosts[i]);
+            g_key_file_set_string(kf, "hosts", nm, app->hosts[i]);
+        if (app->pmodel[i] && *app->pmodel[i])
+            g_key_file_set_string(kf, "models", nm, app->pmodel[i]);
         if (remember && app->keys[i] && *app->keys[i])
-            g_key_file_set_string(kf, "keys", prov_get((ProvId)i)->id_name,
-                                  app->keys[i]);
+            g_key_file_set_string(kf, "keys", nm, app->keys[i]);
     }
     if (!remember)
         g_key_file_remove_group(kf, "keys", NULL);   /* purge stale keys */
@@ -1969,13 +2188,14 @@ static void config_load(App *app)
     app->cfg_provider = 0;
     app->cfg_temp = 0.8;
     app->cfg_topp = 0.9;
-    app->cfg_maxtok = 4096;
+    app->cfg_maxtok = 16384;
     app->cfg_seed = 42;
     app->cfg_stream = TRUE;
     app->cfg_think = THINK_DEFAULT;
     app->cfg_effort = 0;
     app->cfg_remember = FALSE;
     app->cfg_adapt = TRUE;
+    app->cfg_cont = TRUE;
     app->cfg_use_temp = TRUE;
     app->cfg_use_topp = FALSE;
     app->cfg_use_maxtok = FALSE;
@@ -1988,7 +2208,7 @@ static void config_load(App *app)
         app->cfg_model = g_key_file_get_string(kf, "ui", "model", NULL);
         app->cfg_temp  = key_dbl(kf, "gen", "temperature", 0.8);
         app->cfg_topp  = key_dbl(kf, "gen", "top_p", 0.9);
-        app->cfg_maxtok = key_i64(kf, "gen", "max_tokens", 4096);
+        app->cfg_maxtok = key_i64(kf, "gen", "max_tokens", 16384);
         app->cfg_seed  = key_i64(kf, "gen", "seed", 42);
         app->cfg_stream = key_bool(kf, "ui", "stream", TRUE);
         /* older configs: ui/think boolean, and every parameter always sent */
@@ -2001,30 +2221,22 @@ static void config_load(App *app)
         if (app->cfg_effort < 0 || app->cfg_effort >= (int)G_N_ELEMENTS(EFFORTS))
             app->cfg_effort = 0;
         app->cfg_adapt = key_bool(kf, "gen", "auto_adapt", TRUE);
+        app->cfg_cont = key_bool(kf, "gen", "auto_continue", TRUE);
         app->cfg_use_temp = key_bool(kf, "gen", "use_temperature", TRUE);
         app->cfg_use_topp = key_bool(kf, "gen", "use_top_p", FALSE);
-        app->cfg_use_maxtok = key_bool(kf, "gen", "use_max_tokens",
-                                       app->cfg_maxtok > 0);
+        /* a missing switch (old config) means: let the model run to its
+         * own maximum rather than cutting it off at a small value */
+        app->cfg_use_maxtok = key_bool(kf, "gen", "use_max_tokens", FALSE);
         app->cfg_use_seed = key_bool(kf, "gen", "use_seed", app->cfg_seed >= 0);
-        {
-            gsize n = 0, k;
-            char **keys = g_key_file_get_keys(kf, "quirks", &n, NULL);
-
-            for (k = 0; keys && k < n; k++) {
-                guint v = (guint)g_key_file_get_integer(kf, "quirks",
-                                                        keys[k], NULL) & Q_MASK;
-                if (v)
-                    g_hash_table_replace(app->quirks, g_strdup(keys[k]),
-                                         GUINT_TO_POINTER(v));
-            }
-            g_strfreev(keys);
-        }
+        load_int_table(kf, "quirks", app->quirks, Q_MASK);
+        load_int_table(kf, "caps", app->caps, 0x7fffffffu);
         app->cfg_remember = key_bool(kf, "auth", "remember", FALSE);
         for (i = 0; i < PROV_COUNT; i++) {
             const char *nm = prov_get((ProvId)i)->id_name;
 
-            app->keys[i]  = g_key_file_get_string(kf, "keys", nm, NULL);
-            app->hosts[i] = g_key_file_get_string(kf, "hosts", nm, NULL);
+            app->keys[i]   = g_key_file_get_string(kf, "keys", nm, NULL);
+            app->hosts[i]  = g_key_file_get_string(kf, "hosts", nm, NULL);
+            app->pmodel[i] = g_key_file_get_string(kf, "models", nm, NULL);
         }
     }
     g_key_file_free(kf);
@@ -2032,7 +2244,7 @@ static void config_load(App *app)
 }
 
 /* ------------------------------------------------------------------ */
-/*  per-model parameter quirks                                        */
+/*  per-model parameter quirks and output-token caps                  */
 /* ------------------------------------------------------------------ */
 
 static char *quirk_key(ProvId id, const char *model)
@@ -2048,6 +2260,15 @@ static guint model_quirks(App *app, ProvId id, const char *model)
 
     g_free(k);
     return q;
+}
+
+static guint model_cap(App *app, ProvId id, const char *model)
+{
+    char *k = quirk_key(id, model);
+    guint c = GPOINTER_TO_UINT(g_hash_table_lookup(app->caps, k));
+
+    g_free(k);
+    return c ? c : builtin_cap(id, model);
 }
 
 static char *quirk_names(guint q)
@@ -2072,22 +2293,28 @@ static char *quirk_names(guint q)
 
 static void quirks_refresh(App *app)
 {
-    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+    const char *model = current_model(app);
     guint q = model_quirks(app, app->prov_id, model);
+    guint cap = model_cap(app, app->prov_id, model);
     char *k = quirk_key(app->prov_id, model);
+    GString *s = g_string_new(NULL);
 
     if (q) {
         char *names = quirk_names(q);
-        char *txt = g_strdup_printf("Not sent / adapted for this model: %s",
-                                    names);
 
-        gtk_label_set_text(GTK_LABEL(app->quirk_label), txt);
-        g_free(txt);
+        g_string_append_printf(s, "Not sent / adapted for this model: %s",
+                               names);
         g_free(names);
     }
-    gtk_widget_set_visible(app->quirk_label, q != 0);
+    if (cap)
+        g_string_append_printf(s, "%sOutput limit for this model: %u tokens",
+                               s->len ? "\n" : "", cap);
+    gtk_label_set_text(GTK_LABEL(app->quirk_label), s->str);
+    gtk_widget_set_visible(app->quirk_label, s->len > 0);
     gtk_widget_set_visible(app->quirk_reset,
-                           g_hash_table_contains(app->quirks, k));
+                           g_hash_table_contains(app->quirks, k) ||
+                           g_hash_table_contains(app->caps, k));
+    g_string_free(s, TRUE);
     g_free(k);
 }
 
@@ -2097,6 +2324,13 @@ static void quirks_learn(App *app, const char *key, guint add)
 
     g_hash_table_replace(app->quirks, g_strdup(key),
                          GUINT_TO_POINTER((old | add) & Q_MASK));
+    quirks_refresh(app);
+    config_save(app);
+}
+
+static void caps_learn(App *app, const char *key, guint cap)
+{
+    g_hash_table_replace(app->caps, g_strdup(key), GUINT_TO_POINTER(cap));
     quirks_refresh(app);
     config_save(app);
 }
@@ -2114,6 +2348,7 @@ static void gen_params(App *app, const char *model, GenParams *gp)
     gp->temp       = entry_double(app->temp_e);
     gp->top_p      = entry_double(app->topp_e);
     gp->max_tokens = (int)entry_ll(app->maxtok_e, 0);
+    gp->max_cap    = (int)model_cap(app, app->prov_id, model);
     gp->seed       = entry_ll(app->seed_e, -1);
     gp->think      = (t <= THINK_OFF) ? (int)t : THINK_DEFAULT;
     gp->effort     = (e < G_N_ELEMENTS(EFFORTS)) ? EFFORTS[e] : NULL;
@@ -2130,22 +2365,32 @@ static void provider_apply(App *app)
     guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(app->prov_dd));
     ProvId id = (i == GTK_INVALID_LIST_POSITION || (int)i >= PROV_COUNT)
                 ? PROV_OLLAMA : (ProvId)i;
+    ProvId old = app->prov_id;
     char *key = g_strdup(app->keys[id] ? app->keys[id] : "");
     char *host = g_strdup((app->hosts[id] && *app->hosts[id])
                           ? app->hosts[id] : prov_get(id)->default_host);
+    char *model = NULL;
 
-    if (id != app->prov_id) {          /* listed models belong to the old one */
+    if (id != old) {   /* the model name and the listed models belong to the old one */
         guint cnt = g_list_model_get_n_items(G_LIST_MODEL(app->model_list));
 
+        g_free(app->pmodel[old]);
+        app->pmodel[old] = g_strdup(current_model(app));
         g_ptr_array_set_size(app->models, 0);
         if (cnt)
             gtk_string_list_splice(app->model_list, 0, cnt, NULL);
+        model = g_strdup(app->pmodel[id] ? app->pmodel[id]
+                                         : prov_get(id)->default_model);
     }
     app->prov_id = id;
     app->quiet = TRUE;
     gtk_editable_set_text(GTK_EDITABLE(app->key_e), key);
     gtk_editable_set_text(GTK_EDITABLE(app->host_e), host);
     app->quiet = FALSE;
+    if (model) {
+        gtk_editable_set_text(GTK_EDITABLE(app->model_entry), model);
+        g_free(model);
+    }
     gtk_widget_set_sensitive(app->key_e, id != PROV_OLLAMA);
     set_status(app, "Provider: %s", prov_get(id)->label);
     quirks_refresh(app);
@@ -2156,12 +2401,19 @@ static void provider_apply(App *app)
 static void apply_config(App *app)
 {
     char buf[32];
+    const char *m;
 
+    /* pre-set the provider so provider_apply() sees no switch and does
+     * not file the (still empty) model entry under the wrong provider */
+    app->prov_id = (ProvId)app->cfg_provider;
     gtk_drop_down_set_selected(GTK_DROP_DOWN(app->prov_dd),
                                (guint)app->cfg_provider);
     provider_apply(app);                       /* also for the no-change case */
-    if (app->cfg_model && *app->cfg_model)
-        gtk_editable_set_text(GTK_EDITABLE(app->model_entry), app->cfg_model);
+    m = app->pmodel[app->prov_id];
+    if ((!m || !*m) && app->cfg_model && *app->cfg_model)
+        m = app->cfg_model;                    /* older configs */
+    if (m && *m)
+        gtk_editable_set_text(GTK_EDITABLE(app->model_entry), m);
     g_free(app->cfg_model);
     app->cfg_model = NULL;
     g_snprintf(buf, sizeof buf, "%.2f", app->cfg_temp);
@@ -2182,6 +2434,7 @@ static void apply_config(App *app)
     gtk_drop_down_set_selected(GTK_DROP_DOWN(app->effort_dd),
                                (guint)app->cfg_effort);
     gtk_check_button_set_active(GTK_CHECK_BUTTON(app->adapt_cb), app->cfg_adapt);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(app->cont_cb), app->cfg_cont);
     quirks_refresh(app);
     gtk_check_button_set_active(GTK_CHECK_BUTTON(app->remember_cb),
                                 app->cfg_remember);
@@ -2734,8 +2987,7 @@ static char *chat_markdown(App *app)
     guint i;
 
     g_string_append_printf(s, "# Chat transcript\n\n*%s · %s · %s*\n",
-        prov_get(app->prov_id)->label,
-        gtk_editable_get_text(GTK_EDITABLE(app->model_entry)), ts);
+        prov_get(app->prov_id)->label, current_model(app), ts);
     for (i = 0; i < app->history->len; i++) {
         Msg *m = g_ptr_array_index(app->history, i);
         const char *who = !g_strcmp0(m->role, "system")    ? "System"
@@ -2763,8 +3015,7 @@ static char *chat_json(App *app)
 
     json_object_set_string_member(root, "provider",
                                   prov_get(app->prov_id)->id_name);
-    json_object_set_string_member(root, "model",
-        gtk_editable_get_text(GTK_EDITABLE(app->model_entry)));
+    json_object_set_string_member(root, "model", current_model(app));
     json_object_set_string_member(root, "saved", ts);
     json_object_set_array_member(root, "messages",
                                  ollama_messages(app->history));
@@ -3090,11 +3341,41 @@ static void push_delta(Worker *wd, const GString *think, const GString *text)
 
 static void start_request(App *app, guint retries);
 
+/* The finished reply goes into the history. A continuation is merged
+ * into the assistant turn it extends and the nudge that asked for it
+ * is dropped, so the history (and "Save chat"/"Save code") see one
+ * uninterrupted reply. */
+static void history_absorb_reply(App *app)
+{
+    guint n = app->history->len;
+    Msg *last = n ? g_ptr_array_index(app->history, n - 1) : NULL;
+
+    if (app->continuing && last && !g_strcmp0(last->role, "user") &&
+        !g_strcmp0(last->text, CONTINUE_PROMPT)) {
+        g_ptr_array_remove_index(app->history, n - 1);
+        n--;
+        last = n ? g_ptr_array_index(app->history, n - 1) : NULL;
+        if (last && !g_strcmp0(last->role, "assistant")) {
+            char *joined = g_strconcat(last->text, app->reply_acc->str, NULL);
+
+            g_free(last->text);
+            last->text = joined;
+            return;
+        }
+    }
+    g_ptr_array_add(app->history, msg_new("assistant", app->reply_acc->str));
+}
+
 static gboolean worker_done_idle(gpointer data)
 {
     Worker *wd = data;
     App *app = wd->app;
+    gboolean was_cont, truncated, cont_on;
 
+    if (wd->thread) {                      /* it is returning right now */
+        g_thread_join(wd->thread);
+        wd->thread = NULL;
+    }
     worker_drain(wd);                      /* whatever is still queued */
     if (app->worker == wd)
         app->worker = NULL;
@@ -3103,38 +3384,52 @@ static gboolean worker_done_idle(gpointer data)
         worker_unref(wd);
         return G_SOURCE_REMOVE;
     }
+    was_cont = app->continuing;
 
-    /* the API refused a parameter: remember that for this model and
-     * resend the same turn without it (each pass must learn something) */
-    if (wd->error && !wd->cancelled && !app->cur_box && !app->reply_acc->len &&
-        (wd->http_code == 400 || wd->http_code == 422) && wd->retries < 4 &&
+    /* the API refused a parameter or the output-token value: remember
+     * that for this model and resend the same turn (each pass must learn
+     * something; the retry counter bounds the loop) */
+    if (wd->error && !wd->cancelled && !app->reply_acc->len &&
+        (wd->http_code == 400 || wd->http_code == 422) &&
+        wd->retries < MAX_ADAPT_RETRIES &&
         gtk_check_button_get_active(GTK_CHECK_BUTTON(app->adapt_cb))) {
-        guint add = classify_rejection(wd->prov, wd->error, wd->req->sent,
-                                       wd->quirks);
+        int cap = rejection_cap(wd->error, wd->req->max_sent);
+        char *note = NULL;
 
-        if (add) {
-            char *names = quirk_names(add);
-            char *note = g_strdup_printf("⟳ adapting request (%s): %.160s",
-                                         names, wd->error);
+        if (cap > 0) {
+            note = g_strdup_printf("⟳ adapting request (output limit %d "
+                                   "tokens for this model): %.160s",
+                                   cap, wd->error);
+            caps_learn(app, wd->qkey, (guint)cap);
+        } else {
+            guint add = classify_rejection(wd->prov, wd->error,
+                                           wd->req->sent, wd->quirks);
 
+            if (add) {
+                char *names = quirk_names(add);
+
+                note = g_strdup_printf("⟳ adapting request (%s): %.160s",
+                                       names, wd->error);
+                quirks_learn(app, wd->qkey, add);
+                g_free(names);
+            }
+        }
+        if (note) {
             chat_note(app, note, FALSE);
-            quirks_learn(app, wd->qkey, add);
             g_free(note);
-            g_free(names);
             start_request(app, wd->retries + 1);
             worker_unref(wd);
             return G_SOURCE_REMOVE;
         }
     }
 
-    gtk_spinner_stop(GTK_SPINNER(app->spinner));
-    gtk_widget_set_sensitive(app->send_btn, TRUE);
-    gtk_widget_set_sensitive(app->stop_btn, FALSE);
-
     if (app->reply_acc->len) {
-        g_ptr_array_add(app->history, msg_new("assistant", app->reply_acc->str));
+        Msg *reply;
+
+        history_absorb_reply(app);
+        reply = g_ptr_array_index(app->history, app->history->len - 1);
         if (!gtk_widget_get_sensitive(app->code_btn)) {
-            GPtrArray *cb = extract_code(app->reply_acc->str);
+            GPtrArray *cb = extract_code(reply->text);
 
             gtk_widget_set_sensitive(app->code_btn, cb->len > 0);
             g_ptr_array_unref(cb);
@@ -3144,25 +3439,51 @@ static gboolean worker_done_idle(gpointer data)
             app->total_in += wd->in_tok;
         if (wd->out_tok > 0)
             app->total_out += wd->out_tok;
-    } else {
-        if (app->history->len &&
-            !g_strcmp0(((Msg *)g_ptr_array_index(app->history,
-                             app->history->len - 1))->role, "user"))
-            g_ptr_array_remove_index(app->history, app->history->len - 1);
+    } else if (app->history->len &&
+               !g_strcmp0(((Msg *)g_ptr_array_index(app->history,
+                                app->history->len - 1))->role, "user")) {
+        /* the failed turn — or the continuation nudge, which leaves the
+         * partial reply in place */
+        g_ptr_array_remove_index(app->history, app->history->len - 1);
     }
 
     if (app->cur_text_buf)
         buf_rstrip(app->cur_text_buf);
     if (app->cur_think_buf)
         buf_rstrip(app->cur_think_buf);
+
+    /* cut off by the token limit: keep going in the same bubble */
+    truncated = wd->truncated && !wd->error && !wd->cancelled &&
+                app->reply_acc->len > 0;
+    cont_on = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->cont_cb));
+    if (truncated && cont_on && app->cur_box &&
+        app->cont_count < MAX_CONTINUES) {
+        app->cont_count++;
+        asst_continue_marker(app);
+        g_ptr_array_add(app->history, msg_new("user", CONTINUE_PROMPT));
+        app->continuing = TRUE;
+        start_request(app, 0);
+        set_status(app, "token limit reached — continuing (%u of %u)…",
+                   app->cont_count, MAX_CONTINUES);
+        worker_unref(wd);
+        return G_SOURCE_REMOVE;
+    }
+
+    gtk_spinner_stop(GTK_SPINNER(app->spinner));
+    gtk_widget_set_sensitive(app->send_btn, TRUE);
+    gtk_widget_set_sensitive(app->stop_btn, FALSE);
+    app->continuing = FALSE;
     app->cur_box = NULL;
+    app->cur_anchor = NULL;
     app->cur_think_buf = app->cur_text_buf = NULL;
 
     if (wd->error) {
-        char *note = g_strdup_printf(app->reply_acc->len
-                         ? "✕ %s"
-                         : "✕ %s — this turn was not kept in the history",
-                         wd->error);
+        char *note = g_strdup_printf(
+            app->reply_acc->len ? "✕ %s"
+            : was_cont ? "✕ %s — the continuation failed; the partial reply "
+                         "was kept"
+                       : "✕ %s — this turn was not kept in the history",
+            wd->error);
 
         chat_note(app, note, TRUE);
         g_free(note);
@@ -3171,8 +3492,19 @@ static gboolean worker_done_idle(gpointer data)
         chat_note(app, "stopped", FALSE);
         set_status(app, "stopped");
     } else if (app->reply_acc->len) {
+        if (truncated) {
+            char *note = cont_on
+                ? g_strdup_printf("✂ still cut off by the token limit after "
+                                  "%u continuations", app->cont_count)
+                : g_strdup("✂ reply cut off by the token limit — raise "
+                           "Max tokens or enable Auto-continue");
+
+            chat_note(app, note, TRUE);
+            g_free(note);
+        }
         set_status(app,
-            "done · in %lld / out %lld tok · totals %lld/%lld · replies %lld",
+            "done%s · in %lld / out %lld tok · totals %lld/%lld · replies %lld",
+            app->cont_count ? " (continued)" : "",
             (long long)wd->in_tok, (long long)wd->out_tok,
             (long long)app->total_in, (long long)app->total_out,
             (long long)app->requests);
@@ -3279,7 +3611,7 @@ static gpointer worker_thread(gpointer data)
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "ollama-gui/1.0");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "ollama-gui/1.1");
     rc = curl_easy_perform(c);
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     wd->http_code = code;
@@ -3307,7 +3639,8 @@ static gpointer worker_thread(gpointer data)
             char *err = NULL;
 
             if (prov_parse_body(wd->prov, wd->full->str, wd->full->len,
-                                txt, thk, &wd->in_tok, &wd->out_tok, &err))
+                                txt, thk, &wd->in_tok, &wd->out_tok,
+                                &wd->truncated, &err))
                 push_delta(wd, thk, txt);
             else
                 wd->error = err;
@@ -3315,6 +3648,7 @@ static gpointer worker_thread(gpointer data)
             g_string_free(thk, TRUE);
         } else {
             prov_parser_usage(wd->parser, &wd->in_tok, &wd->out_tok);
+            wd->truncated = prov_parser_truncated(wd->parser);
         }
     }
 finish:
@@ -3326,25 +3660,35 @@ finish:
 /*  model-list loading                                                */
 /* ================================================================== */
 
-typedef struct {
-    App    *app;
-    ProvId  id;
-    char   *url;
-    char  **headers;
-    char   *err;
-    char  **names;
-} ModelsJob;
-
 static size_t models_write_cb(char *ptr, size_t s, size_t n, void *ud)
 {
     g_string_append_len((GString *)ud, ptr, s * n);
     return s * n;
 }
 
+static int models_progress(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                           curl_off_t ultotal, curl_off_t ulnow)
+{
+    ModelsJob *j = ud;
+
+    (void)dltotal;
+    (void)dlnow;
+    (void)ultotal;
+    (void)ulnow;
+    return g_atomic_int_get(&j->cancel) ? 1 : 0;
+}
+
 static gboolean models_done_idle(gpointer data)
 {
     ModelsJob *j = data;
     App *app = j->app;
+
+    if (j->thread) {
+        g_thread_join(j->thread);
+        j->thread = NULL;
+    }
+    if (app->models_job == j)
+        app->models_job = NULL;
 
     if (app->closing) {
         /* window already destroyed: just free the job */
@@ -3353,16 +3697,30 @@ static gboolean models_done_idle(gpointer data)
         set_status(app, "model list failed (%s)", prov_get(j->id)->label);
     } else if (j->names && *j->names) {
         guint cnt = g_list_model_get_n_items(G_LIST_MODEL(app->model_list));
+        guint sel = GTK_INVALID_LIST_POSITION, k = 0;
+        char *keep = g_strdup(current_model(app));
         char **n;
 
+        /* refill without touching the model the user typed; re-select
+         * it if it is in the list, fill the entry only when it is empty */
+        app->quiet = TRUE;
         g_ptr_array_set_size(app->models, 0);
         if (cnt)
             gtk_string_list_splice(app->model_list, 0, cnt, NULL);
-        for (n = j->names; *n; n++) {
+        for (n = j->names; *n; n++, k++) {
             g_ptr_array_add(app->models, g_strdup(*n));
             gtk_string_list_append(app->model_list, *n);
+            if (!strcmp(*n, keep))
+                sel = k;
         }
-        gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd), 0);
+        app->quiet = FALSE;
+        if (sel != GTK_INVALID_LIST_POSITION) {
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd), sel);
+        } else if (!*keep) {
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(app->model_dd), 0);
+            gtk_editable_set_text(GTK_EDITABLE(app->model_entry), j->names[0]);
+        }
+        g_free(keep);
         set_status(app, "%u models loaded (%s)",
                    app->models->len, prov_get(j->id)->label);
     } else {
@@ -3397,6 +3755,9 @@ static gpointer models_thread(gpointer data)
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, models_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, models_progress);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA, j);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
@@ -3424,19 +3785,26 @@ out:
 static void on_load_models(GtkButton *b, gpointer data)
 {
     App *app = data;
-    ProvListReq *r = prov_list_models(app->prov_id,
-            gtk_editable_get_text(GTK_EDITABLE(app->host_e)),
-            gtk_editable_get_text(GTK_EDITABLE(app->key_e)));
-    ModelsJob *j = g_new0(ModelsJob, 1);
+    ProvListReq *r;
+    ModelsJob *j;
 
     (void)b;
+    if (app->models_job) {
+        set_status(app, "model list is already loading…");
+        return;
+    }
+    r = prov_list_models(app->prov_id,
+            gtk_editable_get_text(GTK_EDITABLE(app->host_e)),
+            gtk_editable_get_text(GTK_EDITABLE(app->key_e)));
+    j = g_new0(ModelsJob, 1);
     j->app = app;
     j->id = app->prov_id;
     j->url = g_strdup(r->url);
     j->headers = r->headers ? g_strdupv(r->headers) : NULL;
     prov_list_req_free(r);
+    app->models_job = j;
     set_status(app, "loading model list…");
-    g_thread_unref(g_thread_new("prov-models", models_thread, j));
+    j->thread = g_thread_new("prov-models", models_thread, j);
 }
 
 static void on_preview(GtkButton *b, gpointer data)
@@ -3460,7 +3828,7 @@ static void on_preview(GtkButton *b, gpointer data)
         msg_free(next);
     }
     {
-        const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+        const char *model = current_model(app);
         GenParams gp;
 
         gen_params(app, model, &gp);
@@ -3501,10 +3869,11 @@ static void on_preview(GtkButton *b, gpointer data)
     prov_request_free(r);
 }
 
-/* build the request from the current history and settings, and run it */
+/* build the request from the current history and settings, and run it;
+ * bubble state (cur_box & co.) is set up by the caller */
 static void start_request(App *app, guint retries)
 {
-    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+    const char *model = current_model(app);
     gboolean stream = gtk_check_button_get_active(GTK_CHECK_BUTTON(app->stream_cb));
     GenParams gp;
     ProvRequest *req;
@@ -3521,22 +3890,21 @@ static void start_request(App *app, guint retries)
     wd->retries = retries;
     app->worker = wd;
     app->busy = TRUE;
-    app->cur_box = NULL;
-    app->cur_think_buf = app->cur_text_buf = NULL;
     g_string_truncate(app->reply_acc, 0);
 
     gtk_spinner_start(GTK_SPINNER(app->spinner));
     gtk_widget_set_sensitive(app->send_btn, FALSE);
     gtk_widget_set_sensitive(app->stop_btn, TRUE);
-    set_status(app, stream ? "streaming…" : "waiting for reply…");
-    g_thread_unref(g_thread_new("chat", worker_thread, wd));
+    set_status(app, app->continuing ? "continuing…"
+               : stream ? "streaming…" : "waiting for reply…");
+    wd->thread = g_thread_new("chat", worker_thread, wd);
 }
 
 static void on_send(GtkButton *btn, gpointer data)
 {
     App *app = data;
     char *input = buffer_text(app->input_buf);
-    const char *model = gtk_editable_get_text(GTK_EDITABLE(app->model_entry));
+    const char *model = current_model(app);
 
     (void)btn;
     if (app->busy || !input || (!*input && app->att->len == 0)) {
@@ -3567,6 +3935,11 @@ static void on_send(GtkButton *btn, gpointer data)
     gtk_text_buffer_set_text(app->input_buf, "", -1);
     g_free(input);
 
+    app->cur_box = NULL;
+    app->cur_anchor = NULL;
+    app->cur_think_buf = app->cur_text_buf = NULL;
+    app->cont_count = 0;
+    app->continuing = FALSE;
     config_save(app);
     start_request(app, 0);
 }
@@ -3606,6 +3979,8 @@ static void on_new_chat(GtkButton *b, gpointer data)
     chat_clear(app);
     gtk_widget_set_sensitive(app->code_btn, FALSE);
     g_string_truncate(app->reply_acc, 0);
+    app->cont_count = 0;
+    app->continuing = FALSE;
     set_status(app, "new conversation");
 }
 
@@ -3655,11 +4030,11 @@ static void on_model_changed(GtkEditable *e, gpointer data)
 static void on_quirk_reset(GtkButton *b, gpointer data)
 {
     App *app = data;
-    char *k = quirk_key(app->prov_id,
-                        gtk_editable_get_text(GTK_EDITABLE(app->model_entry)));
+    char *k = quirk_key(app->prov_id, current_model(app));
 
     (void)b;
     g_hash_table_remove(app->quirks, k);
+    g_hash_table_remove(app->caps, k);
     g_free(k);
     quirks_refresh(app);
     config_save(app);
@@ -3673,7 +4048,7 @@ static void on_model_selected(GObject *o, GParamSpec *ps, gpointer data)
 
     (void)o;
     (void)ps;
-    if (i == GTK_INVALID_LIST_POSITION || i >= app->models->len)
+    if (app->quiet || i == GTK_INVALID_LIST_POSITION || i >= app->models->len)
         return;
     gtk_editable_set_text(GTK_EDITABLE(app->model_entry),
                           g_ptr_array_index(app->models, i));
@@ -3685,7 +4060,6 @@ static void on_model_activate(GtkEntry *e, gpointer data)
     const char *t = gtk_editable_get_text(GTK_EDITABLE(e));
     guint i;
 
-    (void)e;
     if (!t || !*t)
         return;
     for (i = 0; i < app->models->len; i++)
@@ -3817,9 +4191,11 @@ static void build_settings_pane(App *app, GtkWidget *left)
             { "Top-p", "Nucleus sampling. Unchecked: not sent. Anthropic gets "
               "temperature or top-p, never both.",
               &app->topp_cb, &app->topp_e, "0.9" },
-            { "Max tokens", "Unchecked: provider default. Anthropic requires a "
-              "value and then gets 8192 (16000 with thinking on).",
-              &app->maxtok_cb, &app->maxtok_e, "4096" },
+            { "Max tokens", "Unchecked (recommended): OpenAI, Gemini and "
+              "Ollama run to the model maximum; Anthropic requires a value "
+              "and gets 32000 (64000 with thinking on). Values above a "
+              "model's limit are learned and clamped automatically.",
+              &app->maxtok_cb, &app->maxtok_e, "16384" },
             { "Seed", "Fixed seed for repeatable sampling. Not sent to "
               "Anthropic, which has no seed.",
               &app->seed_cb, &app->seed_e, "42" },
@@ -3869,6 +4245,15 @@ static void build_settings_pane(App *app, GtkWidget *left)
         gtk_check_button_set_active(GTK_CHECK_BUTTON(app->adapt_cb), TRUE);
         gtk_grid_attach(GTK_GRID(grid), app->adapt_cb, 0, 6, 2, 1);
 
+        app->cont_cb = gtk_check_button_new_with_label(
+            "Auto-continue a reply cut off by the token limit");
+        gtk_widget_set_tooltip_text(app->cont_cb,
+            "When a reply stops because of the output-token limit, send "
+            "\"continue\" and append the result to the same reply "
+            "(up to 8 times per turn).");
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(app->cont_cb), TRUE);
+        gtk_grid_attach(GTK_GRID(grid), app->cont_cb, 0, 7, 2, 1);
+
         hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         app->quirk_label = gtk_label_new(NULL);
         gtk_label_set_wrap(GTK_LABEL(app->quirk_label), TRUE);
@@ -3884,7 +4269,7 @@ static void build_settings_pane(App *app, GtkWidget *left)
         gtk_box_append(GTK_BOX(hbox), app->quirk_reset);
         gtk_widget_set_visible(app->quirk_label, FALSE);
         gtk_widget_set_visible(app->quirk_reset, FALSE);
-        gtk_grid_attach(GTK_GRID(grid), hbox, 0, 7, 2, 1);
+        gtk_grid_attach(GTK_GRID(grid), hbox, 0, 8, 2, 1);
     }
     hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     app->stream_cb = gtk_check_button_new_with_label("Stream");
@@ -3892,7 +4277,7 @@ static void build_settings_pane(App *app, GtkWidget *left)
     app->newchat_btn = gtk_button_new_with_label("New chat");
     gtk_box_append(GTK_BOX(hbox), app->stream_cb);
     gtk_box_append(GTK_BOX(hbox), app->newchat_btn);
-    gtk_grid_attach(GTK_GRID(grid), hbox, 0, 8, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), hbox, 0, 9, 2, 1);
     gtk_box_append(GTK_BOX(left), f);
 
     /* pad signal wiring */
@@ -3916,10 +4301,11 @@ static void build_settings_pane(App *app, GtkWidget *left)
 
 static void build_chat_pane(App *app, GtkWidget *right)
 {
-    GtkWidget *sw, *cbox, *row, *arow, *scroll_in;
+    GtkWidget *sw, *cbox, *row, *arow, *scroll_in, *sep, *frame;
     GtkEventController *key, *motion;
     GtkGesture *click;
 
+    /* ---- transcript ---- */
     app->chat_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_add_css_class(app->chat_box, "chat");
 
@@ -3927,6 +4313,8 @@ static void build_chat_pane(App *app, GtkWidget *right)
     app->chat_sw = sw;
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
                                     GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(sw), TRUE);
+    gtk_widget_add_css_class(sw, "chat-window");
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), app->chat_box);
     gtk_widget_set_vexpand(sw, TRUE);
     gtk_box_append(GTK_BOX(right), sw);
@@ -3954,7 +4342,18 @@ static void build_chat_pane(App *app, GtkWidget *right)
                              G_CALLBACK(drag_scroll_stop), app);
     gtk_widget_add_controller(sw, GTK_EVENT_CONTROLLER(click));
 
-    cbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    /* ---- a visible break, then the composer in its own frame ---- */
+    sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_margin_top(sep, 6);
+    gtk_widget_set_margin_bottom(sep, 2);
+    gtk_box_append(GTK_BOX(right), sep);
+
+    frame = gtk_frame_new("Your message  ·  Ctrl+Enter sends");
+    gtk_widget_add_css_class(frame, "composer");
+    cbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    margins(cbox, 8);
+    gtk_frame_set_child(GTK_FRAME(frame), cbox);
+
     app->input_buf = gtk_text_buffer_new(NULL);
     {
         GtkWidget *iv = gtk_text_view_new_with_buffer(app->input_buf);
@@ -3967,16 +4366,20 @@ static void build_chat_pane(App *app, GtkWidget *right)
         gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_in),
                                         GTK_POLICY_AUTOMATIC,
                                         GTK_POLICY_AUTOMATIC);
+        gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(scroll_in), TRUE);
+        gtk_widget_add_css_class(scroll_in, "composer-input");
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll_in), iv);
-        gtk_widget_set_size_request(scroll_in, -1, 90);
+        gtk_widget_set_size_request(scroll_in, -1, 110);
     }
 
     row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     app->send_btn = gtk_button_new_with_label("Send");
+    gtk_widget_add_css_class(app->send_btn, "suggested-action");
     app->stop_btn = gtk_button_new_with_label("Stop");
     gtk_widget_set_sensitive(app->stop_btn, FALSE);
     app->spinner = gtk_spinner_new();
     app->status = gtk_label_new("ready");
+    gtk_label_set_ellipsize(GTK_LABEL(app->status), PANGO_ELLIPSIZE_END);
     gtk_widget_set_halign(app->status, GTK_ALIGN_START);
     gtk_widget_set_hexpand(app->status, TRUE);
     g_signal_connect(app->send_btn, "clicked", G_CALLBACK(on_send), app);
@@ -4021,7 +4424,7 @@ static void build_chat_pane(App *app, GtkWidget *right)
     gtk_box_append(GTK_BOX(cbox), scroll_in);
     gtk_box_append(GTK_BOX(cbox), arow);
     gtk_box_append(GTK_BOX(cbox), row);
-    gtk_box_append(GTK_BOX(right), cbox);
+    gtk_box_append(GTK_BOX(right), frame);
 }
 
 /* ================================================================== */
@@ -4043,6 +4446,8 @@ static gboolean on_close_request(GtkWindow *w, gpointer data)
     config_save(app);
     if (app->worker)
         g_atomic_int_set(&app->worker->cancel, 1);
+    if (app->models_job)
+        g_atomic_int_set(&app->models_job->cancel, 1);
     app->closing = TRUE;
     return FALSE;                          /* let the window close */
 }
@@ -4053,9 +4458,27 @@ static void on_shutdown(GApplication *gapp, gpointer data)
     int i;
 
     (void)gapp;
+    /* the main loop is over: let the background threads finish before
+     * curl_global_cleanup() runs (their idles never fire; they leak a
+     * few bytes, which is fine at exit) */
+    if (app->worker) {
+        g_atomic_int_set(&app->worker->cancel, 1);
+        if (app->worker->thread) {
+            g_thread_join(app->worker->thread);
+            app->worker->thread = NULL;
+        }
+    }
+    if (app->models_job) {
+        g_atomic_int_set(&app->models_job->cancel, 1);
+        if (app->models_job->thread) {
+            g_thread_join(app->models_job->thread);
+            app->models_job->thread = NULL;
+        }
+    }
     for (i = 0; i < PROV_COUNT; i++) {
         g_free(app->keys[i]);
         g_free(app->hosts[i]);
+        g_free(app->pmodel[i]);
     }
 }
 
@@ -4063,7 +4486,6 @@ static void activate(GtkApplication *gtkapp, gpointer user)
 {
     App *app = g_new0(App, 1);
     GtkWidget *win, *paned, *left_sw, *left, *right;
-    int i;
 
     (void)user;
     app->history = g_ptr_array_new_with_free_func(msg_free);
@@ -4071,10 +4493,7 @@ static void activate(GtkApplication *gtkapp, gpointer user)
     app->reply_acc = g_string_new(NULL);
     app->att = g_ptr_array_new_with_free_func(attachment_free);
     app->quirks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    for (i = 0; i < PROV_COUNT; i++) {
-        app->keys[i] = NULL;
-        app->hosts[i] = NULL;
-    }
+    app->caps = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     config_load(app);
 
     win = gtk_application_window_new(gtkapp);
@@ -4110,7 +4529,8 @@ static void activate(GtkApplication *gtkapp, gpointer user)
     chat_note(app,
         "Pick a provider, paste its API key, load models, then send "
         "(Ctrl+Enter sends). Attach… adds images or text files to the "
-        "next message.", FALSE);
+        "next message. Replies cut off by the token limit are continued "
+        "automatically.", FALSE);
 
     g_signal_connect(win, "close-request", G_CALLBACK(on_close_request), app);
     g_signal_connect(gtkapp, "shutdown", G_CALLBACK(on_shutdown), app);
